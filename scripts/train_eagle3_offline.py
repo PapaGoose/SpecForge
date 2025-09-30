@@ -118,8 +118,15 @@ def parse_args():
         "--report-to",
         type=str,
         default="none",
-        choices=["wandb", "tensorboard", "swanlab", "mlflow", "none"],
+        choices=["wandb", "tensorboard", "swanlab", "mlflow", "clearml", "none"],
         help="The integration to report results and logs to.",
+    )
+    # clearml args
+    parser.add_argument(
+        "--clearml-project-name", type=str, default=None, help="The project name for clearml."
+    )
+    parser.add_argument(
+        "--clearml-jira-task", type=str, default=None, help="Jira task name."
     )
     # wandb-specific args
     parser.add_argument(
