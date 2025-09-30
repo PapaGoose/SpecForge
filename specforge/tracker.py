@@ -129,7 +129,9 @@ class ClearmlTracker(Tracker):
 
     def log(self, log_dict: Dict[str, Any], step: Optional[int] = None):
         if self.rank == 0 and self.is_initialized:
-            clearml.Logger.current_logger().report_scalar(**log_dict, iteration=step)
+            for key, value in log_dict.items():
+                if isinstance(value, (int, float)):
+                    clearml.Logger.current_logger().report_scalar(series=key, value=value, iteration=step)
 
     def close(self):
         if self.rank == 0 and self.is_initialized:
