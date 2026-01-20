@@ -29,6 +29,10 @@ try:
 except ImportError:
     mlflow = None
 
+try:
+    import clearml
+except ImportError:
+    clearml = None
 
 # --- End Lazy Imports ---
 
@@ -86,6 +90,51 @@ class NoOpTracker(Tracker):
 
     def close(self):
         pass  # Do nothing
+
+
+class ClearmlTracker(Tracker):
+    """Tracks experiments using Clearml."""
+
+    @classmethod
+    def validate_args(cls, parser, args):
+        if clearml is None:
+            parser.error(
+                "To use --report-to clearml, you must install clearml: 'pip install clearml'"
+            )
+
+        if args.clearml_project_name is None:
+            parser.error(
+                "Set project_name for your Task"
+            )
+
+        if args.clearml_jira_task is None:
+            parser.error(
+                "Set jira_task for your Task"
+            )
+
+    def __init__(self, args, output_dir: str):
+        super().__init__(args, output_dir)
+        if self.rank == 0:
+            self.task = clearml.Task.init(
+                project_name=args.clearm_project_name,
+                task_name=f'[{clearml_jira_task}] Spec Dec Training',
+                output_uri='s3://storage.yandexcloud.net:443/clearml-fndrs/experiments',
+                reuse_last_task_id=False,
+                auto_connect_frameworks=False
+            )
+            self.is_initialized = True
+
+    def log(self, log_dict: Dict[str, Any], step: Optional[int] = None):
+        if self.rank == 0 and self.is_initialized:
+            for key, value in log_dict.items():
+                if isinstance(value, (int, float)):
+                    clearml.Logger.current_logger().report_scalar(series=key, value=value, iteration=step)
+
+    def close(self):
+        if self.rank == 0 and self.is_initialized:
+            self.task.close()
+            self.is_initialized = False
+
 
 
 class WandbTracker(Tracker):
@@ -281,6 +330,7 @@ TRACKER_REGISTRY = {
     "tensorboard": TensorboardTracker,
     "mlflow": MLflowTracker,
     "none": NoOpTracker,
+    "clearml": ClearmlTracker
 }
 
 
