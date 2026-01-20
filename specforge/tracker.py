@@ -118,7 +118,7 @@ class ClearmlTracker(Tracker):
             self.task = clearml.Task.init(
                 project_name=args.clearm_project_name,
                 task_name=f'[{clearml_jira_task}] Spec Dec Training',
-                output_uri='s3://storage.yandexcloud.net:443/clearml-fndrs/experiments',
+                output_uri='s3://storage.mwsapis.ru:443/clearml-fndrs/experiments',
                 reuse_last_task_id=False,
                 auto_connect_frameworks=False
             )
