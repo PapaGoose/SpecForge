@@ -225,6 +225,20 @@ def parse_args() -> Tuple[ArgumentParser, Namespace]:
 
     # tracker related args
     tracker_group = parser.add_argument_group("tracker")
+    tracker_group.add_argument(
+        "--report-to",
+        type=str,
+        default="none",
+        choices=["wandb", "tensorboard", "swanlab", "mlflow", "clearml", "none"],
+        help="The integration to report results and logs to.",
+    )
+    # clearml args
+    tracker_group.add_argument(
+        "--clearml-project-name", type=str, default=None, help="The project name for clearml."
+    )
+    tracker_group.add_argument(
+        "--clearml-jira-task", type=str, default=None, help="Jira task name."
+    )
     TrackerArgs.add_args(tracker_group)
 
     args = parser.parse_args()
