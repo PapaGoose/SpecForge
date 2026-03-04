@@ -26,8 +26,14 @@ class TrackerArgs:
             "--report-to",
             type=str,
             default="none",
-            choices=["wandb", "tensorboard", "swanlab", "mlflow", "none"],
+            choices=["wandb", "tensorboard", "swanlab", "mlflow", "none", "clearml"],
             help="The integration to report results and logs to.",
+        )
+        parser.add_argument(
+            "--clearml-project-name", type=str, default=None, help="The project name for clearml."
+        )
+        parser.add_argument(
+            "--clearml-jira-task", type=str, default=None, help="Jira task name."
         )
         # wandb-specific args
         parser.add_argument("--wandb-project", type=str, default=None)

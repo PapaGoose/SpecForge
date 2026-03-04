@@ -130,7 +130,7 @@ def initialize_model_parallel(
         ),
         group_name="tp",
         pynccl_use_current_stream=duplicate_tp_group,
-        torch_compile=torch_compile,
+        # torch_compile=torch_compile,
     )
 
     if duplicate_tp_group:
@@ -149,7 +149,7 @@ def initialize_model_parallel(
             ),
             group_name="pdmux_prefill_tp",
             pynccl_use_current_stream=True,
-            torch_compile=torch_compile,
+            # torch_compile=torch_compile,
         )
         parallel_state._TP.pynccl_comm.disabled = False
         parallel_state._PDMUX_PREFILL_TP_GROUP.pynccl_comm.disabled = False

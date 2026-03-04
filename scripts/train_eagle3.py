@@ -225,20 +225,6 @@ def parse_args() -> Tuple[ArgumentParser, Namespace]:
 
     # tracker related args
     tracker_group = parser.add_argument_group("tracker")
-    tracker_group.add_argument(
-        "--report-to",
-        type=str,
-        default="none",
-        choices=["wandb", "tensorboard", "swanlab", "mlflow", "clearml", "none"],
-        help="The integration to report results and logs to.",
-    )
-    # clearml args
-    tracker_group.add_argument(
-        "--clearml-project-name", type=str, default=None, help="The project name for clearml."
-    )
-    tracker_group.add_argument(
-        "--clearml-jira-task", type=str, default=None, help="Jira task name."
-    )
     TrackerArgs.add_args(tracker_group)
 
     args = parser.parse_args()
@@ -385,7 +371,8 @@ def build_draft_model(args: Namespace) -> Tuple[AutoDraftModelConfig, nn.Module]
             )
 
     # detecting last ckpt for draft model
-    if args.resume and os.path.isdir(args.output_dir):
+    if args.resume:
+        print(args.output_dir)
         print_on_rank0(args.output_dir)
         draft_model_last_checkpoint = get_last_checkpoint(args.output_dir)
         print_on_rank0(f"Last checkpoint detected: {draft_model_last_checkpoint}")
@@ -740,7 +727,6 @@ def main():
     is_online = (
         args.train_data_path is not None and args.train_hidden_states_path is None
     )
-
     sanity_check(args)
     print_args_with_dots(args)
     print_with_rank("Initialized distributed environment")

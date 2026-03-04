@@ -116,8 +116,8 @@ class ClearmlTracker(Tracker):
         super().__init__(args, output_dir)
         if self.rank == 0:
             self.task = clearml.Task.init(
-                project_name=args.clearm_project_name,
-                task_name=f'[{clearml_jira_task}] Spec Dec Training',
+                project_name=args.clearml_project_name,
+                task_name=f'[{args.clearml_jira_task}] Spec Dec Training',
                 output_uri='s3://storage.mwsapis.ru:443/clearml-fndrs/experiments',
                 reuse_last_task_id=False,
                 auto_connect_frameworks=False
@@ -128,7 +128,7 @@ class ClearmlTracker(Tracker):
         if self.rank == 0 and self.is_initialized:
             for key, value in log_dict.items():
                 if isinstance(value, (int, float)):
-                    clearml.Logger.current_logger().report_scalar(series=key, value=value, iteration=step)
+                    clearml.Logger.current_logger().report_scalar(title='logs', series=key, value=value, iteration=step)
 
     def close(self):
         if self.rank == 0 and self.is_initialized:
