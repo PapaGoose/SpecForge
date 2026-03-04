@@ -1,3 +1,4 @@
+import json
 import re
 import warnings
 from abc import ABC, abstractmethod
@@ -42,12 +43,31 @@ class GeneralParser(Parser):
         self.system_prompt = chat_template.system_prompt
         self.user_message_separator = f"{chat_template.end_of_turn_token}"
         self.assistant_message_separator = f"{chat_template.assistant_header}"
+        self.set_assistant_pattern(chat_template)
 
     def apply_chat_template(self, messages, **kwargs) -> str:
         conversation = self.tokenizer.apply_chat_template(
             messages, tokenize=False, add_generation_prompt=False, **kwargs
         )
         return conversation
+
+    def set_assistant_pattern(self, chat_template: ChatTemplate):
+        if chat_template.assistant_pattern_type == "longcat":
+            self.assistant_pattern = (
+                re.escape(self.assistant_message_separator)
+                + r"([\s\S]*?(?:"
+                + re.escape("[Round ")
+                + r"\d+"
+                + re.escape("] USER:")
+                + "|$))"
+            )
+        else:
+            self.assistant_pattern = (
+                re.escape(self.assistant_message_separator)
+                + r"([\s\S]*?(?:"
+                + re.escape(self.chat_template.end_of_turn_token)
+                + "|$))"
+            )
 
     def parse(
         self,
@@ -92,6 +112,13 @@ class GeneralParser(Parser):
                             f"An 'assistant' message must follow a 'user' or 'tool' message, but was preceded by '{prev_role}'. Conversation truncated."
                         )
                         break
+                tool_calls = sentence.get("tool_calls")
+                if isinstance(tool_calls, str):
+                    try:
+                        sentence["tool_calls"] = json.loads(tool_calls)
+                    except json.JSONDecodeError:
+                        warnings.warn(f"Failed to parse tool_calls JSON: {tool_calls}")
+                        break
                 messages.append(sentence)
 
             try:
@@ -123,12 +150,6 @@ class GeneralParser(Parser):
         if not self.tokenizer.pad_token_id:
             self.tokenizer.pad_token_id = self.tokenizer.unk_token_id
 
-        assistant_pattern = (
-            re.escape(self.assistant_message_separator)
-            + r"([\s\S]*?(?:"
-            + re.escape(self.chat_template.end_of_turn_token)
-            + "|$))"
-        )
         # get input_ids
         encoding = self.tokenizer(
             conversation,
@@ -140,7 +161,7 @@ class GeneralParser(Parser):
         input_ids = encoding.input_ids[0]
         loss_mask = torch.zeros(len(input_ids), dtype=torch.long)
 
-        matches = list(re.finditer(assistant_pattern, conversation, re.DOTALL))
+        matches = list(re.finditer(self.assistant_pattern, conversation, re.DOTALL))
         if train_only_last_turn and matches:
             matches = [matches[-1]]  # Only keep the last match
 
@@ -151,11 +172,17 @@ class GeneralParser(Parser):
             # --- Core Alternative Operation: Calculate Token Index Based on Prefix String Length ---
             # Encode the text "assistant start", the length of which is the position of the starting token.
             prefix_ids = self.tokenizer.encode(
-                conversation[:content_start_char], add_special_tokens=False
+                conversation[:content_start_char],
+                add_special_tokens=False,
+                truncation=True,
+                max_length=max_length,
             )
             # Encodes the text "assistant end", the length of which is the position of the end token.
             full_ids = self.tokenizer.encode(
-                conversation[:content_end_char], add_special_tokens=False
+                conversation[:content_end_char],
+                add_special_tokens=False,
+                truncation=True,
+                max_length=max_length,
             )
 
             start_token_idx = len(prefix_ids)
