@@ -43,6 +43,7 @@ from specforge.modeling.target import (
     TargetHead,
     get_eagle3_target_model,
 )
+from specforge.modeling.target.eagle3_target_model import Eagle3TargetOutput
 from specforge.optimizer import BF16Optimizer
 from specforge.tracker import Tracker, create_tracker, get_tracker_class
 from specforge.utils import (
@@ -345,8 +346,9 @@ def sanity_check(args: Namespace) -> None:
         None
     """
     args.dp_size = dist.get_world_size() // args.tp_size
+    args.dataloader_batch_size = args.tp_size * args.batch_size
     if args.target_batch_size is None:
-        args.target_batch_size = args.tp_size * args.batch_size
+        args.target_batch_size = args.dataloader_batch_size
     if args.attention_backend == "usp":
         sp_sanity_check(args)
 
@@ -482,7 +484,7 @@ def build_dataloaders(
 
     train_dataloader = prepare_dp_dataloaders(
         train_eagle3_dataset,
-        args.target_batch_size,
+        args.dataloader_batch_size,
         num_workers=args.dataloader_num_workers,
         shuffle=True,
         process_group=(
@@ -518,7 +520,7 @@ def build_dataloaders(
             )
         eval_dataloader = prepare_dp_dataloaders(
             eval_eagle3_dataset,
-            args.target_batch_size,
+            args.dataloader_batch_size,
             num_workers=args.dataloader_num_workers,
             shuffle=False,
             process_group=(
@@ -580,6 +582,50 @@ def save_checkpoints(
         dist.barrier()
 
 
+def generate_eagle3_data_chunked(
+    target_model: Eagle3TargetModel,
+    data: dict,
+    target_batch_size: int,
+) -> Eagle3TargetOutput:
+    """
+    Run generate_eagle3_data in chunks of target_batch_size.
+
+    When target_batch_size < dataloader_batch_size (e.g. target_batch_size=1 with tp=8),
+    the target model is called multiple times so each forward pass stays within the memory
+    budget, then the results are concatenated before sharding across TP ranks.
+    """
+    n = data["input_ids"].shape[0]
+    if n <= target_batch_size:
+        return target_model.generate_eagle3_data(
+            input_ids=data["input_ids"].cuda(),
+            attention_mask=data["attention_mask"].cuda(),
+            loss_mask=data["loss_mask"].cuda(),
+        )
+
+    outputs = []
+    for start in range(0, n, target_batch_size):
+        end = min(start + target_batch_size, n)
+        out = target_model.generate_eagle3_data(
+            input_ids=data["input_ids"][start:end].cuda(),
+            attention_mask=data["attention_mask"][start:end].cuda(),
+            loss_mask=data["loss_mask"][start:end].cuda(),
+        )
+        outputs.append(out)
+
+    last_hidden_states = None
+    if all(o.last_hidden_states is not None for o in outputs):
+        last_hidden_states = torch.cat([o.last_hidden_states for o in outputs], dim=0)
+
+    return Eagle3TargetOutput(
+        input_ids=torch.cat([o.input_ids for o in outputs], dim=0),
+        attention_mask=torch.cat([o.attention_mask for o in outputs], dim=0),
+        loss_mask=torch.cat([o.loss_mask for o in outputs], dim=0),
+        target=torch.cat([o.target for o in outputs], dim=0),
+        hidden_states=torch.cat([o.hidden_states for o in outputs], dim=0),
+        last_hidden_states=last_hidden_states,
+    )
+
+
 def run_forward(
     args: Namespace,
     eagle3_model: nn.Module,
@@ -617,10 +663,8 @@ def run_forward(
                     image_grid_thw=image_grid_thw,
                 )
             else:
-                eagle3_data = target_model.generate_eagle3_data(
-                    input_ids=data["input_ids"].cuda(),
-                    attention_mask=data["attention_mask"].cuda(),
-                    loss_mask=data["loss_mask"].cuda(),
+                eagle3_data = generate_eagle3_data_chunked(
+                    target_model, data, args.target_batch_size
                 )
 
             input_ids = get_dp_data_shard_from_tp(eagle3_data.input_ids)
@@ -710,9 +754,6 @@ def get_dp_data_shard_from_tp(tensor: torch.Tensor) -> torch.Tensor:
     Get the data shard from the tensor.
     """
     tp_size = dist.get_world_size(get_tp_group())
-    if tensor.shape[0] < tp_size:
-        # target_batch_size < tp_size: all TP ranks share the same data
-        return tensor
     tp_rank = dist.get_rank(get_tp_group())
     return tensor.chunk(tp_size, dim=0)[tp_rank]
 
