@@ -610,12 +610,25 @@ def generate_eagle3_data_chunked(
             attention_mask=data["attention_mask"][start:end].cuda(),
             loss_mask=data["loss_mask"][start:end].cuda(),
         )
-        outputs.append(out)
+        # Offload to CPU immediately so GPU memory is freed before the next chunk.
+        outputs.append(Eagle3TargetOutput(
+            input_ids=out.input_ids.cpu(),
+            attention_mask=out.attention_mask.cpu(),
+            loss_mask=out.loss_mask.cpu(),
+            target=out.target.cpu(),
+            hidden_states=out.hidden_states.cpu(),
+            last_hidden_states=(
+                out.last_hidden_states.cpu()
+                if out.last_hidden_states is not None
+                else None
+            ),
+        ))
 
     last_hidden_states = None
     if all(o.last_hidden_states is not None for o in outputs):
         last_hidden_states = torch.cat([o.last_hidden_states for o in outputs], dim=0)
 
+    # Concatenation happens on CPU; get_dp_data_shard_from_tp moves the shard to GPU.
     return Eagle3TargetOutput(
         input_ids=torch.cat([o.input_ids for o in outputs], dim=0),
         attention_mask=torch.cat([o.attention_mask for o in outputs], dim=0),
@@ -755,7 +768,7 @@ def get_dp_data_shard_from_tp(tensor: torch.Tensor) -> torch.Tensor:
     """
     tp_size = dist.get_world_size(get_tp_group())
     tp_rank = dist.get_rank(get_tp_group())
-    return tensor.chunk(tp_size, dim=0)[tp_rank]
+    return tensor.chunk(tp_size, dim=0)[tp_rank].cuda()
 
 
 def main():
