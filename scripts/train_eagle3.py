@@ -174,6 +174,13 @@ def parse_args() -> Tuple[ArgumentParser, Namespace]:
         default=1,
         help="The size of the tensor parallel for the target model",
     )
+    optimization_group.add_argument(
+        "--target-batch-size",
+        type=int,
+        default=None,
+        help="Batch size for the target model. Defaults to tp_size * batch_size. "
+             "Set explicitly (e.g. 1) when the target model can only fit fewer samples than tp_size.",
+    )
     # distributed training
     optimization_group.add_argument("--sp-ulysses-size", type=int, default=1)
     optimization_group.add_argument("--sp-ring-size", type=int, default=1)
@@ -338,7 +345,8 @@ def sanity_check(args: Namespace) -> None:
         None
     """
     args.dp_size = dist.get_world_size() // args.tp_size
-    args.target_batch_size = args.tp_size * args.batch_size
+    if args.target_batch_size is None:
+        args.target_batch_size = args.tp_size * args.batch_size
     if args.attention_backend == "usp":
         sp_sanity_check(args)
 
@@ -702,6 +710,9 @@ def get_dp_data_shard_from_tp(tensor: torch.Tensor) -> torch.Tensor:
     Get the data shard from the tensor.
     """
     tp_size = dist.get_world_size(get_tp_group())
+    if tensor.shape[0] < tp_size:
+        # target_batch_size < tp_size: all TP ranks share the same data
+        return tensor
     tp_rank = dist.get_rank(get_tp_group())
     return tensor.chunk(tp_size, dim=0)[tp_rank]
 
