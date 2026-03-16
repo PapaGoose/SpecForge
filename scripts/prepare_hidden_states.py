@@ -165,13 +165,6 @@ def parse_args():
         default=None,
         help="S3 base URI for ClearML upload, e.g. s3://bucket/path/to/run.",
     )
-    others_group.add_argument(
-        "--upload-threshold-gb",
-        type=float,
-        default=50.0,
-        help="Trigger S3 upload after this many GB of files have accumulated (default: 50.0).",
-    )
-
     sglang_group = parser.add_argument_group("sglang")
     SGLangBackendArgs.add_args(sglang_group)
     args = parser.parse_args()
@@ -251,7 +244,6 @@ class HiddenStatesGenerator:
         compress: bool = False,
         compression_level: int = 6,
         s3_output_uri: Optional[str] = None,
-        upload_threshold_gb: float = 50.0,
     ):
         """
         Args:
@@ -261,7 +253,6 @@ class HiddenStatesGenerator:
             io_queue_size: Max number of pending I/O futures before cleanup.
             file_group_size: Number of files per subdirectory.
             s3_output_uri: S3 base URI for ClearML upload. If None, upload is disabled.
-            upload_threshold_gb: Trigger upload after this many GB accumulated.
         """
         self.model = target_model
         self.enable_aux_hidden_states = enable_aux_hidden_states
@@ -276,9 +267,8 @@ class HiddenStatesGenerator:
 
         # --- S3 upload parameters ---
         self.s3_output_uri = s3_output_uri
-        self._upload_threshold_bytes = int(upload_threshold_gb * 1024**3)
         self._queued_for_upload: List[str] = []
-        self._bytes_accumulated: int = 0
+        self._current_upload_group: Optional[str] = None
         self._upload_chunk_index: int = 0
         self._output_path: Optional[str] = None
 
@@ -389,21 +379,6 @@ class HiddenStatesGenerator:
             ):
                 future.result()  # Wait and raise exception if any
             self.pending_futures.clear()
-
-    def _estimate_data_point_bytes(self, data_point: DataPoint) -> int:
-        """Estimate the disk size of a DataPoint based on tensor nbytes."""
-        total = 0
-        for field in (
-            data_point.input_ids,
-            data_point.loss_mask,
-            data_point.hidden_state,
-            data_point.aux_hidden_state,
-        ):
-            if field is not None and hasattr(field, "nbytes"):
-                total += field.nbytes
-        if self.compress:
-            total = int(total * 0.3)
-        return total
 
     def _upload_chunk_to_s3_and_delete(
         self, files: List[str], output_path: str
@@ -678,21 +653,23 @@ class HiddenStatesGenerator:
                     output_file = self._get_file_path(output_path, current_global_idx)
                     self._save_tensor_async(data_point, output_file)
 
-                    # 4. Track accumulated bytes for periodic S3 upload
+                    # 4. Upload completed file groups to S3
                     if self.s3_output_uri:
-                        self._bytes_accumulated += self._estimate_data_point_bytes(
-                            data_point
-                        )
-                        self._queued_for_upload.append(output_file)
-                        if self._bytes_accumulated >= self._upload_threshold_bytes:
+                        file_group_dir = os.path.dirname(output_file)
+                        if (
+                            self._current_upload_group is not None
+                            and file_group_dir != self._current_upload_group
+                        ):
+                            # New group started — upload and delete the completed group
                             self._wait_all_saves()
                             files_to_upload = list(self._queued_for_upload)
                             self._queued_for_upload.clear()
-                            self._bytes_accumulated = 0
                             self._upload_chunk_to_s3_and_delete(
                                 files_to_upload, output_path
                             )
                             self._upload_chunk_index += 1
+                        self._current_upload_group = file_group_dir
+                        self._queued_for_upload.append(output_file)
 
                     # 5. Immediately clean up the single-sample CPU tensors
                     del last_hidden_states, aux_hidden_states
@@ -840,7 +817,6 @@ def main():
             compress=args.compress,
             compression_level=args.compression_level,
             s3_output_uri=args.s3_output_uri if args.clearml_upload else None,
-            upload_threshold_gb=args.upload_threshold_gb,
         ) as hidden_states_generator:
 
             # Generate hidden states
