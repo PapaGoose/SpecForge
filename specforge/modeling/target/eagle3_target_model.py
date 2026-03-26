@@ -127,21 +127,24 @@ class HFEagle3TargetModel(Eagle3TargetModel):
         """
         tp_size = get_tp_group().size()
 
-        # Load model without TP first — avoids PySafeSlice crash with
-        # quantized models (compressed-tensors INT8) where safetensors
-        # lazy slices don't have .shape attribute needed by HF TP sharding.
+        if tp_size > 1:
+            device_kwargs = {
+                "tp_plan": "auto",
+                "tp_size": tp_size,
+                "device_mesh": get_tp_device_mesh(),
+            }
+        else:
+            device_kwargs = {
+                "device_map": device,
+            }
+
         target_model = AutoModelForCausalLM.from_pretrained(
             pretrained_model_name_or_path,
             torch_dtype=torch_dtype,
             cache_dir=cache_dir,
-            device_map=device,
+            **device_kwargs,
             **kwargs,
         )
-
-        # Apply tensor parallelism post-load (available since transformers 4.47)
-        if tp_size > 1:
-            target_model.tensor_parallel(get_tp_device_mesh())
-
         return cls(target_model)
 
     def _get_transformer_layers(self):
