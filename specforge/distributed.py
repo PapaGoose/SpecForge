@@ -17,6 +17,14 @@ _DRAFT_SP_GROUP = None
 _SP_ULYSSES_GROUP = None
 _SP_RING_GROUP = None
 
+# Split-mode globals (target and draft on disjoint GPUs)
+_SPLIT_MODE = False
+_TARGET_RANKS = []
+_DRAFT_RANKS = []
+_DRAFT_FSDP_GROUP = None
+_DRAFT_DP_GROUP_SPLIT = None
+_TRANSFER_GROUP = None
+
 
 def get_tp_group():
     global _TP_GROUP
@@ -61,6 +69,146 @@ def get_sp_ulysses_group():
 def get_sp_ring_group():
     global _SP_RING_GROUP
     return _SP_RING_GROUP
+
+
+def is_split_mode():
+    global _SPLIT_MODE
+    return _SPLIT_MODE
+
+
+def is_target_rank():
+    global _SPLIT_MODE, _TARGET_RANKS
+    if not _SPLIT_MODE:
+        return False
+    return dist.get_rank() in _TARGET_RANKS
+
+
+def is_draft_rank():
+    global _SPLIT_MODE, _DRAFT_RANKS
+    if not _SPLIT_MODE:
+        return False
+    return dist.get_rank() in _DRAFT_RANKS
+
+
+def get_draft_fsdp_group():
+    global _DRAFT_FSDP_GROUP
+    return _DRAFT_FSDP_GROUP
+
+
+def get_draft_dp_group_split():
+    global _DRAFT_DP_GROUP_SPLIT
+    return _DRAFT_DP_GROUP_SPLIT
+
+
+def get_transfer_group():
+    global _TRANSFER_GROUP
+    return _TRANSFER_GROUP
+
+
+def get_transfer_src_rank():
+    """Return the global rank of the source for data transfer (target rank 0)."""
+    return 0
+
+
+def init_distributed_split(timeout: int = 10, tp_size: int = 1, draft_dp_size: int = 1):
+    """Initialize distributed training with split GPU allocation.
+
+    Target model gets GPUs [0, tp_size-1] for TP inference.
+    Draft model gets GPUs [tp_size, world_size-1] for FSDP training + DP.
+
+    Args:
+        timeout: Timeout for collective communication in minutes.
+        tp_size: Number of GPUs for target model (tensor parallelism degree).
+        draft_dp_size: Number of data-parallel replicas on draft side.
+            draft_gpu_count / draft_dp_size = FSDP group size per replica.
+    """
+    global _SPLIT_MODE, _TARGET_RANKS, _DRAFT_RANKS
+    global _TP_GROUP, _DP_GROUP, _TP_DEVICE_MESH, _DP_DEVICE_MESH
+    global _DRAFT_FSDP_GROUP, _DRAFT_DP_GROUP_SPLIT, _TRANSFER_GROUP
+
+    dist.init_process_group(backend="nccl", timeout=timedelta(minutes=timeout))
+    local_rank = dist.get_rank() % torch.cuda.device_count()
+    torch.cuda.set_device(local_rank)
+    print_with_rank(f"bind to device {local_rank}")
+
+    world_size = dist.get_world_size()
+    rank = dist.get_rank()
+
+    assert world_size > tp_size, (
+        f"Split mode requires world_size ({world_size}) > tp_size ({tp_size}). "
+        f"Need at least 1 GPU for draft model."
+    )
+
+    draft_gpu_count = world_size - tp_size
+    assert draft_gpu_count % draft_dp_size == 0, (
+        f"Number of draft GPUs ({draft_gpu_count}) must be divisible by "
+        f"draft_dp_size ({draft_dp_size})."
+    )
+    fsdp_group_size = draft_gpu_count // draft_dp_size
+
+    _SPLIT_MODE = True
+    _TARGET_RANKS = list(range(tp_size))
+    _DRAFT_RANKS = list(range(tp_size, world_size))
+
+    # Create target TP group (all ranks must participate in new_group)
+    target_group = dist.new_group(_TARGET_RANKS)
+
+    # Create per-DP-replica FSDP groups on draft side
+    # E.g., 4 draft GPUs [4,5,6,7], draft_dp_size=2, fsdp_size=2:
+    #   FSDP group 0: [4,5], FSDP group 1: [6,7]
+    my_fsdp_group = None
+    for i in range(draft_dp_size):
+        start = tp_size + i * fsdp_group_size
+        fsdp_ranks = list(range(start, start + fsdp_group_size))
+        group = dist.new_group(fsdp_ranks)
+        if rank in fsdp_ranks:
+            my_fsdp_group = group
+
+    # Create DP groups across FSDP replicas (ranks at same position within each replica)
+    # E.g., draft ranks [4,5,6,7], draft_dp_size=2, fsdp_size=2:
+    #   DP group 0: [4,6] (position 0 in each replica)
+    #   DP group 1: [5,7] (position 1 in each replica)
+    my_dp_group = None
+    for pos in range(fsdp_group_size):
+        dp_ranks = [tp_size + i * fsdp_group_size + pos for i in range(draft_dp_size)]
+        group = dist.new_group(dp_ranks)
+        if rank in dp_ranks:
+            my_dp_group = group
+
+    # Transfer group: target rank 0 + all draft ranks (for broadcasting target output)
+    transfer_group = dist.new_group([0] + _DRAFT_RANKS)
+
+    # Create single-rank groups for SP (split mode doesn't use sequence parallelism)
+    # Needed by DataCollatorWithPadding which calls get_draft_sp_group()
+    for r in range(world_size):
+        group = dist.new_group([r])
+        if rank == r:
+            my_sp_group = group
+
+    global _DRAFT_SP_GROUP, _SP_ULYSSES_GROUP, _SP_RING_GROUP
+    _DRAFT_DP_GROUP = my_dp_group if rank in _DRAFT_RANKS else None
+    _DRAFT_SP_GROUP = my_sp_group
+    _SP_ULYSSES_GROUP = my_sp_group
+    _SP_RING_GROUP = my_sp_group
+
+    # Set globals
+    _TP_GROUP = target_group
+    _TP_DEVICE_MESH = dist.DeviceMesh.from_group(target_group, device_type="cuda")
+    _DRAFT_FSDP_GROUP = my_fsdp_group
+    _DRAFT_DP_GROUP_SPLIT = my_dp_group
+    _TRANSFER_GROUP = transfer_group
+
+    # Set DP_GROUP: for draft ranks use their DP group, for target ranks use target group
+    if rank in _DRAFT_RANKS:
+        _DP_GROUP = my_dp_group
+    else:
+        _DP_GROUP = target_group
+
+    print_with_rank(
+        f"split mode: {'target' if rank in _TARGET_RANKS else 'draft'} rank, "
+        f"tp_size={tp_size}, draft_gpu_count={draft_gpu_count}, "
+        f"draft_dp_size={draft_dp_size}, fsdp_group_size={fsdp_group_size}"
+    )
 
 
 def init_distributed(
@@ -122,13 +270,18 @@ def init_distributed(
 
 def destroy_distributed():
     global _TP_GROUP, _DP_GROUP, _SP_ULYSSES_GROUP, _SP_RING_GROUP, _DRAFT_DP_GROUP
-    dist.destroy_process_group(_TP_GROUP)
-    dist.destroy_process_group(_DP_GROUP)
-    dist.destroy_process_group(_SP_ULYSSES_GROUP)
-    dist.destroy_process_group(_SP_RING_GROUP)
-    dist.destroy_process_group(_DRAFT_DP_GROUP)
-    dist.destroy_process_group(_DRAFT_SP_GROUP)
-    dist.destroy_process_group()
+    global _SPLIT_MODE, _DRAFT_FSDP_GROUP, _DRAFT_DP_GROUP_SPLIT, _TRANSFER_GROUP
+    if _SPLIT_MODE:
+        # In split mode, clean up split-specific groups
+        dist.destroy_process_group()
+    else:
+        dist.destroy_process_group(_TP_GROUP)
+        dist.destroy_process_group(_DP_GROUP)
+        dist.destroy_process_group(_SP_ULYSSES_GROUP)
+        dist.destroy_process_group(_SP_RING_GROUP)
+        dist.destroy_process_group(_DRAFT_DP_GROUP)
+        dist.destroy_process_group(_DRAFT_SP_GROUP)
+        dist.destroy_process_group()
 
 
 def shard_tensor(

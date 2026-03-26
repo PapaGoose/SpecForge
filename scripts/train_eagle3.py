@@ -35,8 +35,12 @@ from specforge.distributed import (
     destroy_distributed,
     get_dp_group,
     get_draft_dp_group,
+    get_draft_fsdp_group,
     get_tp_group,
     init_distributed,
+    init_distributed_split,
+    is_draft_rank,
+    is_target_rank,
 )
 from specforge.modeling.target import (
     Eagle3TargetModel,
@@ -179,7 +183,7 @@ def parse_args() -> Tuple[ArgumentParser, Namespace]:
         type=int,
         default=None,
         help="Batch size for the target model. Defaults to tp_size * batch_size. "
-             "Set explicitly (e.g. 1) when the target model can only fit fewer samples than tp_size.",
+        "Set explicitly (e.g. 1) when the target model can only fit fewer samples than tp_size.",
     )
     # distributed training
     optimization_group.add_argument("--sp-ulysses-size", type=int, default=1)
@@ -189,6 +193,19 @@ def parse_args() -> Tuple[ArgumentParser, Namespace]:
         type=str,
         default="flex_attention",
         help="The attention backend for the draft model",
+    )
+    optimization_group.add_argument(
+        "--split-target-draft",
+        action="store_true",
+        help="Split GPUs: first tp_size GPUs run target model only (inference), "
+        "remaining GPUs run draft model only (training with FSDP).",
+    )
+    optimization_group.add_argument(
+        "--draft-dp-size",
+        type=int,
+        default=1,
+        help="Number of data-parallel replicas on the draft side in split mode. "
+        "draft_gpu_count / draft_dp_size = FSDP group size per replica.",
     )
 
     # other args
@@ -349,6 +366,33 @@ def sanity_check(args: Namespace) -> None:
         args.target_batch_size = args.tp_size * args.batch_size
     if args.attention_backend == "usp":
         sp_sanity_check(args)
+    if args.split_target_draft:
+        split_sanity_check(args)
+
+
+def split_sanity_check(args: Namespace) -> None:
+    world_size = dist.get_world_size()
+    assert world_size > args.tp_size, (
+        f"Split mode requires world_size ({world_size}) > tp_size ({args.tp_size}). "
+        f"Need at least 1 GPU for draft model."
+    )
+    assert args.target_model_backend != "sglang", (
+        "Split mode does not support SGLang backend. "
+        "Use --target-model-backend hf or --target-model-backend custom."
+    )
+    draft_gpu_count = world_size - args.tp_size
+    assert draft_gpu_count % args.draft_dp_size == 0, (
+        f"Number of draft GPUs ({draft_gpu_count}) must be divisible by "
+        f"draft_dp_size ({args.draft_dp_size})."
+    )
+    assert not args.is_vlm, (
+        "Split mode does not support VLM models yet. "
+        "VLM requires target_model on draft ranks for position_ids computation."
+    )
+    is_online = (
+        args.train_data_path is not None and args.train_hidden_states_path is None
+    )
+    assert is_online, "Split mode only supports online training."
 
 
 def sp_sanity_check(args: Namespace) -> None:
@@ -372,6 +416,17 @@ def sp_sanity_check(args: Namespace) -> None:
             "For online mode, set only eval_data_path. "
             "For offline mode, set only eval_hidden_states_path."
         )
+
+
+def build_draft_model_config(args: Namespace) -> AutoDraftModelConfig:
+    """Build only the draft model config (no GPU memory). Used by target ranks in split mode."""
+    if args.draft_model_config is None:
+        auto_config_path = create_draft_config_from_target(
+            target_model_path=args.target_model_path, cache_dir=args.model_download_dir
+        )
+        return AutoDraftModelConfig.from_file(auto_config_path)
+    else:
+        return AutoDraftModelConfig.from_file(args.draft_model_config)
 
 
 def build_draft_model(args: Namespace) -> Tuple[AutoDraftModelConfig, nn.Module]:
@@ -723,12 +778,19 @@ def main():
     # ================================================
     parser, args = parse_args()
     set_seed(args.seed)
-    init_distributed(
-        timeout=args.dist_timeout,
-        tp_size=args.tp_size,
-        sp_ring_size=args.sp_ring_size,
-        sp_ulysses_size=args.sp_ulysses_size,
-    )
+    if args.split_target_draft:
+        init_distributed_split(
+            timeout=args.dist_timeout,
+            tp_size=args.tp_size,
+            draft_dp_size=args.draft_dp_size,
+        )
+    else:
+        init_distributed(
+            timeout=args.dist_timeout,
+            tp_size=args.tp_size,
+            sp_ring_size=args.sp_ring_size,
+            sp_ulysses_size=args.sp_ulysses_size,
+        )
     is_online = (
         args.train_data_path is not None and args.train_hidden_states_path is None
     )
@@ -739,19 +801,39 @@ def main():
     # ================================================
     # 2. Build models
     # ================================================
-    draft_model_config, draft_model = build_draft_model(args)
-    target_model, processor = build_target_model(args, draft_model_config, is_online)
+    if args.split_target_draft:
+        # Split mode: target and draft on disjoint GPU sets
+        if is_target_rank():
+            # Target ranks only need config (no draft model on GPU)
+            draft_model_config = build_draft_model_config(args)
+            draft_model = None
+            target_model, processor = build_target_model(
+                args, draft_model_config, is_online
+            )
+        else:
+            # Draft ranks build the draft model, no target model
+            draft_model_config, draft_model = build_draft_model(args)
+            target_model = None
+            processor = None
+    else:
+        draft_model_config, draft_model = build_draft_model(args)
+        target_model, processor = build_target_model(
+            args, draft_model_config, is_online
+        )
 
     # ================================================
     # 3. Build dataloader
     # ================================================
+    # All ranks build dataloaders (needed for vocab_mapping_path and step counting).
+    # In split mode, only target ranks iterate; draft ranks receive via transfer.
     train_dataloader, vocab_mapping_path, eval_dataloader = build_dataloaders(
         args, draft_model_config, processor
     )
 
     # we load the vocab mapping then
-    draft_model.load_vocab_mapping(vocab_mapping_path)
-    print_with_rank("Loaded vocab mapping")
+    if draft_model is not None:
+        draft_model.load_vocab_mapping(vocab_mapping_path)
+        print_with_rank("Loaded vocab mapping")
 
     # Calculate total steps if not provided
     if args.total_steps is None:
@@ -768,57 +850,77 @@ def main():
     # ================================================
     # 4. Build Eagle3 model
     # ================================================
-    if (
-        args.is_vlm
-        and getattr(draft_model_config, "target_model_type", None) == "qwen2_5_vl"
-        and args.tp_size == 1
-        and args.target_model_backend != "sglang"
-    ):
-        eagle3_model = QwenVLOnlineEagle3Model(
-            target_model=target_model,
-            draft_model=draft_model,
-            processor=processor,
-            length=args.ttt_length,
-            attention_backend=args.attention_backend,
-        )
+    eagle3_model = None
+    optimizer = None
+    if args.split_target_draft and is_target_rank():
+        # Target ranks don't need eagle3_model or optimizer
+        pass
     else:
-        if is_online:
-            eagle3_model = OnlineEagle3Model(
+        if (
+            args.is_vlm
+            and getattr(draft_model_config, "target_model_type", None) == "qwen2_5_vl"
+            and args.tp_size == 1
+            and args.target_model_backend != "sglang"
+        ):
+            eagle3_model = QwenVLOnlineEagle3Model(
                 target_model=target_model,
                 draft_model=draft_model,
+                processor=processor,
                 length=args.ttt_length,
                 attention_backend=args.attention_backend,
             )
         else:
-            # offline: the target_model is TargetHead not a model
-            eagle3_model = OnlineEagle3Model(
-                draft_model=draft_model,
-                length=args.ttt_length,
-                attention_backend=args.attention_backend,
-            )
-    eagle3_model = FSDP(
-        eagle3_model,
-        use_orig_params=True,
-        mixed_precision=MixedPrecision(
-            param_dtype=torch.bfloat16,
-            buffer_dtype=torch.bfloat16,
-        ),
-        sharding_strategy=ShardingStrategy.SHARD_GRAD_OP,
-        process_group=dist.group.WORLD,  # the draft model should run dp for all processes
-    )
-    print_with_rank("Initialized Eagle3 FSDP model")
+            if is_online:
+                eagle3_model = OnlineEagle3Model(
+                    target_model=target_model,
+                    draft_model=draft_model,
+                    length=args.ttt_length,
+                    attention_backend=args.attention_backend,
+                )
+            else:
+                # offline: the target_model is TargetHead not a model
+                eagle3_model = OnlineEagle3Model(
+                    draft_model=draft_model,
+                    length=args.ttt_length,
+                    attention_backend=args.attention_backend,
+                )
 
-    # ================================================
-    # 5. Build optimizer and scheduler
-    # ================================================
-    optimizer = BF16Optimizer(
-        draft_model,
-        lr=args.learning_rate,
-        max_grad_norm=args.max_grad_norm,
-        warmup_ratio=args.warmup_ratio,
-        total_steps=args.total_steps,
-    )
-    print_with_rank("Initialized optimizer and scheduler")
+        if args.split_target_draft:
+            # Draft ranks in split mode: FSDP FULL_SHARD on draft FSDP group
+            eagle3_model = FSDP(
+                eagle3_model,
+                use_orig_params=True,
+                mixed_precision=MixedPrecision(
+                    param_dtype=torch.bfloat16,
+                    buffer_dtype=torch.bfloat16,
+                ),
+                sharding_strategy=ShardingStrategy.FULL_SHARD,
+                process_group=get_draft_fsdp_group(),
+            )
+        else:
+            eagle3_model = FSDP(
+                eagle3_model,
+                use_orig_params=True,
+                mixed_precision=MixedPrecision(
+                    param_dtype=torch.bfloat16,
+                    buffer_dtype=torch.bfloat16,
+                ),
+                sharding_strategy=ShardingStrategy.SHARD_GRAD_OP,
+                process_group=dist.group.WORLD,  # the draft model should run dp for all processes
+            )
+        print_with_rank("Initialized Eagle3 FSDP model")
+
+        # ================================================
+        # 5. Build optimizer and scheduler
+        # ================================================
+        optimizer = BF16Optimizer(
+            draft_model,
+            lr=args.learning_rate,
+            max_grad_norm=args.max_grad_norm,
+            warmup_ratio=args.warmup_ratio,
+            total_steps=args.total_steps,
+        )
+        print_with_rank("Initialized optimizer and scheduler")
 
     # ================================================
     # 6. Build tracker
@@ -835,8 +937,59 @@ def main():
     # ================================================
     print_on_rank0(f"Starting training from epoch {start_epoch}")
 
+    if args.split_target_draft:
+        _run_split_training_loop(
+            args=args,
+            is_online=is_online,
+            eagle3_model=eagle3_model,
+            draft_model=draft_model,
+            target_model=target_model,
+            optimizer=optimizer,
+            train_dataloader=train_dataloader,
+            eval_dataloader=eval_dataloader,
+            tracker=tracker,
+            global_step=global_step,
+            start_epoch=start_epoch,
+            last_time=last_time,
+        )
+    else:
+        _run_standard_training_loop(
+            args=args,
+            is_online=is_online,
+            eagle3_model=eagle3_model,
+            draft_model=draft_model,
+            target_model=target_model,
+            optimizer=optimizer,
+            train_dataloader=train_dataloader,
+            eval_dataloader=eval_dataloader,
+            tracker=tracker,
+            global_step=global_step,
+            start_epoch=start_epoch,
+            last_time=last_time,
+        )
+
+    # Close the tracker
+    tracker.close()
+    destroy_distributed()
+
+
+def _run_standard_training_loop(
+    *,
+    args,
+    is_online,
+    eagle3_model,
+    draft_model,
+    target_model,
+    optimizer,
+    train_dataloader,
+    eval_dataloader,
+    tracker,
+    global_step,
+    start_epoch,
+    last_time,
+):
+    """Original training loop: all ranks run both target and draft models."""
     for epoch in range(start_epoch, args.num_epochs):
-        # Run training
         train_dataloader.sampler.set_epoch(epoch + 1)
         draft_model.train()
 
@@ -850,11 +1003,8 @@ def main():
         for data in progress_bar:
             global_step += 1
 
-            # ================================================
-            # 7.0 Profiling
-            # ================================================
+            # Profiling
             if args.profile:
-                # we add the step by 1 to align with global step
                 if global_step == args.profile_start_step + 1:
                     print("Start profile")
                     torch_profiler = torch.profiler.profile(
@@ -875,9 +1025,7 @@ def main():
                     torch_profiler.stop()
                     torch_profiler.export_chrome_trace(output_path)
 
-            # ================================================
-            # 7.1 Training Step
-            # ================================================
+            # Training Step
             plosses, acces = run_forward(
                 args,
                 eagle3_model,
@@ -912,9 +1060,7 @@ def main():
                     }
                 )
 
-            # ================================================
-            # 7.2 Evaluation Step
-            # ================================================
+            # Evaluation Step
             should_evaluate = (
                 args.eval_data_path is not None
                 or args.eval_hidden_states_path is not None
@@ -924,7 +1070,6 @@ def main():
                 and global_step % (args.eval_interval * args.draft_accumulation_steps)
                 == 0
             ):
-                # Run evaluation
                 draft_model.eval()
                 eval_acces = [[] for _ in range(eagle3_model.length)]
                 eval_plosses = [[] for _ in range(eagle3_model.length)]
@@ -941,7 +1086,6 @@ def main():
                             eval_plosses[i] + [plosses[i]] for i in range(len(plosses))
                         ]
 
-                # compute average over all minibatches
                 eval_acces = [torch.stack(acc).mean() for acc in eval_acces]
                 eval_plosses = [torch.stack(pl).mean() for pl in eval_plosses]
 
@@ -953,11 +1097,8 @@ def main():
                     tracker,
                     mode="eval",
                 )
-            # ================================================
-            # 7.3 Save Checkpoints
-            # ================================================
+            # Save Checkpoints
             if global_step % args.save_interval == 0:
-                # Save the model
                 save_checkpoints(args, epoch, global_step, eagle3_model, optimizer)
 
             if args.max_num_steps is not None and global_step >= args.max_num_steps:
@@ -965,6 +1106,7 @@ def main():
 
         if args.max_num_steps is not None and global_step >= args.max_num_steps:
             break
+
     # Save final checkpoint if training ended without saving
     if global_step % args.save_interval != 0:
         print_on_rank0(
@@ -972,9 +1114,226 @@ def main():
         )
         save_checkpoints(args, epoch, global_step, eagle3_model, optimizer)
 
-    # Close the tracker
-    tracker.close()
-    destroy_distributed()
+
+def _run_split_training_loop(
+    *,
+    args,
+    is_online,
+    eagle3_model,
+    draft_model,
+    target_model,
+    optimizer,
+    train_dataloader,
+    eval_dataloader,
+    tracker,
+    global_step,
+    start_epoch,
+    last_time,
+):
+    """Split-mode training loop: target and draft on disjoint GPU sets."""
+    from specforge.transfer import TargetOutputTransfer
+
+    transfer = TargetOutputTransfer()
+
+    for epoch in range(start_epoch, args.num_epochs):
+        train_dataloader.sampler.set_epoch(epoch + 1)
+
+        if is_target_rank():
+            # ---- TARGET RANK LOOP ----
+            if dist.get_rank() == 0:
+                progress_bar = tqdm(
+                    train_dataloader, desc=f"[Target] Epoch {epoch}", leave=True
+                )
+            else:
+                progress_bar = train_dataloader
+
+            for data in progress_bar:
+                global_step += 1
+
+                # Run target model inference
+                eagle3_data = target_model.generate_eagle3_data(
+                    input_ids=data["input_ids"].cuda(),
+                    attention_mask=data["attention_mask"].cuda(),
+                    loss_mask=data["loss_mask"].cuda(),
+                )
+
+                # Transfer to draft ranks (only rank 0 broadcasts, other target ranks idle)
+                if dist.get_rank() == 0:
+                    transfer.gather_and_send(eagle3_data)
+
+                if args.max_num_steps is not None and global_step >= args.max_num_steps:
+                    break
+
+        else:
+            # ---- DRAFT RANK LOOP ----
+            draft_model.train()
+            steps_per_epoch = len(train_dataloader)
+            first_draft_rank = args.tp_size  # first draft rank global id
+
+            if dist.get_rank() == first_draft_rank:
+                progress_bar = tqdm(
+                    range(steps_per_epoch),
+                    desc=f"[Draft] Epoch {epoch}",
+                    leave=True,
+                )
+            else:
+                progress_bar = range(steps_per_epoch)
+
+            for _step in progress_bar:
+                global_step += 1
+
+                # Receive data from target ranks
+                eagle3_data = transfer.receive_and_shard()
+
+                # Run draft model forward
+                plosses, acces = run_forward_split(args, eagle3_model, eagle3_data)
+                run_backward_and_update(args, plosses, optimizer, global_step)
+
+                # Log training metrics
+                if (
+                    global_step % (args.log_interval * args.draft_accumulation_steps)
+                    == 0
+                ):
+                    record_metrcs_split(
+                        args,
+                        acces,
+                        plosses,
+                        global_step // args.draft_accumulation_steps,
+                        tracker,
+                        optimizer,
+                        mode="train",
+                    )
+
+                if dist.get_rank() == first_draft_rank:
+                    time_per_step = time.time() - last_time
+                    last_time = time.time()
+                    avg_loss = sum(pl for pl in plosses) / len(plosses)
+                    avg_acc = sum(acces) / len(acces)
+                    progress_bar.set_postfix(
+                        {
+                            "loss": f"{avg_loss:.2f}",
+                            "acc": f"{avg_acc:.2f}",
+                            "time": f"{time_per_step:.2f}s",
+                        }
+                    )
+
+                # Save Checkpoints (draft ranks only)
+                if global_step % args.save_interval == 0:
+                    save_checkpoints_split(
+                        args, epoch, global_step, eagle3_model, optimizer
+                    )
+
+                if args.max_num_steps is not None and global_step >= args.max_num_steps:
+                    break
+
+        if args.max_num_steps is not None and global_step >= args.max_num_steps:
+            break
+
+    # Save final checkpoint (draft ranks only)
+    if is_draft_rank() and global_step % args.save_interval != 0:
+        print_on_rank0(
+            f"Training completed at step {global_step}, saving final checkpoint..."
+        )
+        save_checkpoints_split(args, epoch, global_step, eagle3_model, optimizer)
+
+
+def run_forward_split(
+    args: Namespace,
+    eagle3_model: nn.Module,
+    eagle3_data,
+) -> Tuple[List[torch.Tensor], List[torch.Tensor]]:
+    """Run draft model forward in split mode with pre-computed target output."""
+    plosses, _, acces = eagle3_model(
+        input_ids=eagle3_data.input_ids,
+        attention_mask=eagle3_data.attention_mask,
+        loss_mask=eagle3_data.loss_mask,
+        target=eagle3_data.target,
+        hidden_states=eagle3_data.hidden_states,
+    )
+    return plosses, acces
+
+
+def record_metrcs_split(
+    args: Namespace,
+    accuracies: List[torch.Tensor],
+    plosses: List[torch.Tensor],
+    global_step: int,
+    tracker: Tracker,
+    optimizer: Optional[Optimizer] = None,
+    mode: str = "train",
+) -> None:
+    """Record metrics in split mode, reducing only across draft FSDP group."""
+    logdict = {}
+
+    if mode == "train" and optimizer is not None:
+        logdict["train/lr"] = optimizer.get_learning_rate()
+
+    accuracies = torch.stack(accuracies)
+    plosses = torch.stack(plosses)
+
+    assert accuracies.shape[0] == args.ttt_length
+    # Reduce across draft FSDP group instead of WORLD
+    draft_fsdp_group = get_draft_fsdp_group()
+    dist.all_reduce(accuracies, op=dist.ReduceOp.AVG, group=draft_fsdp_group)
+    accuracies = accuracies.cpu().tolist()
+    for i in range(len(accuracies)):
+        logdict[f"{mode}/acc_{i}"] = accuracies[i]
+        print_on_rank0(
+            f"Eval - Step {global_step} [{global_step + 1}/{args.num_epochs}], position {i},  Acc: {accuracies[i]:.2f}"
+        )
+
+    dist.all_reduce(plosses, op=dist.ReduceOp.AVG, group=draft_fsdp_group)
+    plosses = plosses.cpu().tolist()
+    for i in range(len(plosses)):
+        logdict[f"{mode}/ploss_{i}"] = plosses[i]
+        print_on_rank0(
+            f"Eval - Step {global_step} [{global_step + 1}/{args.num_epochs}], position {i}, pLoss: {plosses[i]}"
+        )
+    tracker.log(logdict, step=global_step)
+
+
+def save_checkpoints_split(
+    args: Namespace,
+    epoch: int,
+    step: int,
+    eagle3_model: nn.Module,
+    optimizer: Optimizer,
+):
+    """Save checkpoints in split mode. Only draft ranks participate."""
+    draft_fsdp_group = get_draft_fsdp_group()
+    epoch_output_dir = os.path.join(args.output_dir, f"epoch_{epoch}_step_{step}")
+    if dist.get_rank(draft_fsdp_group) == 0:
+        os.makedirs(epoch_output_dir, exist_ok=True)
+    dist.barrier(group=draft_fsdp_group)
+
+    with FSDP.state_dict_type(eagle3_model, StateDictType.FULL_STATE_DICT):
+        model_state_dict = eagle3_model.state_dict()
+        state_to_save = {
+            "epoch": epoch,
+            "global_step": step,
+            "args": args,
+        }
+        state_to_save.update(optimizer.state_dict())
+        draft_model_state_dict = {
+            k.replace("draft_model.", ""): v
+            for k, v in model_state_dict.items()
+            if "draft_model." in k and "embed" not in k.lower()
+        }
+
+        if dist.get_rank(draft_fsdp_group) == 0:
+            torch.save(
+                state_to_save,
+                os.path.join(epoch_output_dir, "training_state.pt"),
+            )
+            print_with_rank(
+                f"Saved full training state to {epoch_output_dir}/training_state.pt"
+            )
+            eagle3_model.draft_model.save_pretrained(
+                epoch_output_dir,
+                state_dict=draft_model_state_dict,
+            )
+            print_with_rank(f"Saved model configuration to {epoch_output_dir}")
+        dist.barrier(group=draft_fsdp_group)
 
 
 if __name__ == "__main__":
