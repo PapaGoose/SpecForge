@@ -10,7 +10,6 @@ import torch.distributed as dist
 
 from specforge.distributed import (
     get_draft_dp_group_split,
-    get_tp_group,
     get_transfer_group,
     get_transfer_src_rank,
 )
@@ -24,23 +23,6 @@ _TENSOR_FIELDS: List[Tuple[str, torch.dtype]] = [
     ("input_ids", torch.long),
     ("attention_mask", torch.long),
 ]
-
-
-def _gather_from_tp(tensor: torch.Tensor, tp_group: dist.ProcessGroup) -> torch.Tensor:
-    """Gather tensor along batch dim from all TP ranks to rank 0."""
-    tp_size = dist.get_world_size(tp_group)
-    if tp_size <= 1:
-        return tensor
-    tp_rank = dist.get_rank(tp_group)
-
-    # All TP ranks have the same data when batch_size < tp_size
-    if tensor.shape[0] < tp_size:
-        return tensor
-
-    # Gather all chunks on TP rank 0
-    gathered = [torch.empty_like(tensor) for _ in range(tp_size)]
-    dist.all_gather(gathered, tensor.contiguous(), group=tp_group)
-    return torch.cat(gathered, dim=0)
 
 
 def _shard_by_dp(tensor: torch.Tensor, dp_group: dist.ProcessGroup) -> torch.Tensor:
@@ -63,8 +45,11 @@ class TargetOutputTransfer:
     Broadcasts metadata (shapes) first, then each tensor.
 
     On target rank 0: call send() with the eagle3_data.
-    On other target ranks: call send_noop() to participate in TP gather without broadcast.
-    On draft ranks: call receive() to get the data.
+    On draft ranks: call receive() or receive_and_shard() to get the data.
+
+    Note: No TP gather is needed before sending because each TP rank already
+    holds the full identical batch after generate_eagle3_data() — the custom
+    backend uses all_reduce internally and lm_head uses gather_output=True.
     """
 
     def __init__(self):
@@ -116,21 +101,6 @@ class TargetOutputTransfer:
             received[field_name] = tensor
 
         return Eagle3TargetOutput(**received)
-
-    def gather_and_send(self, eagle3_data: Eagle3TargetOutput) -> None:
-        """Gather full batch from TP ranks, then broadcast from rank 0.
-
-        Called on target rank 0. Gathers across TP group before broadcasting.
-        """
-        tp_group = get_tp_group()
-        gathered = Eagle3TargetOutput(
-            hidden_states=_gather_from_tp(eagle3_data.hidden_states, tp_group),
-            target=_gather_from_tp(eagle3_data.target, tp_group),
-            loss_mask=_gather_from_tp(eagle3_data.loss_mask, tp_group),
-            input_ids=_gather_from_tp(eagle3_data.input_ids, tp_group),
-            attention_mask=_gather_from_tp(eagle3_data.attention_mask, tp_group),
-        )
-        self.send(gathered)
 
     def receive_and_shard(self) -> Eagle3TargetOutput:
         """Receive data and shard by draft DP group.

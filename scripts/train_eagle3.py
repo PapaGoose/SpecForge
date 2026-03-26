@@ -1157,9 +1157,12 @@ def _run_split_training_loop(
                     loss_mask=data["loss_mask"].cuda(),
                 )
 
-                # Transfer to draft ranks (only rank 0 broadcasts, other target ranks idle)
+                # Transfer to draft ranks — rank 0 broadcasts directly.
+                # No TP gather needed: each TP rank already holds the full
+                # identical batch after generate_eagle3_data() (model uses
+                # all_reduce internally, lm_head uses gather_output=True).
                 if dist.get_rank() == 0:
-                    transfer.gather_and_send(eagle3_data)
+                    transfer.send(eagle3_data)
 
                 if args.max_num_steps is not None and global_step >= args.max_num_steps:
                     break
