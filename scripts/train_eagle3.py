@@ -925,6 +925,10 @@ def main():
     # ================================================
     # 6. Build tracker
     # ================================================
+    if args.split_target_draft:
+        # In split mode, first draft rank handles logging (global rank 0 is target)
+        first_draft_rank = args.tp_size
+        args._tracker_rank = 0 if dist.get_rank() == first_draft_rank else 1
     tracker = build_tracker(args, parser)
     global_step = 0
     start_epoch = 0
@@ -1267,6 +1271,7 @@ def record_metrcs_split(
 ) -> None:
     """Record metrics in split mode, reducing only across draft FSDP group."""
     logdict = {}
+    first_draft_rank = args.tp_size
 
     if mode == "train" and optimizer is not None:
         logdict["train/lr"] = optimizer.get_learning_rate()
@@ -1281,17 +1286,19 @@ def record_metrcs_split(
     accuracies = accuracies.cpu().tolist()
     for i in range(len(accuracies)):
         logdict[f"{mode}/acc_{i}"] = accuracies[i]
-        print_on_rank0(
-            f"Eval - Step {global_step} [{global_step + 1}/{args.num_epochs}], position {i},  Acc: {accuracies[i]:.2f}"
-        )
+        if dist.get_rank() == first_draft_rank:
+            print_with_rank(
+                f"Eval - Step {global_step} [{global_step + 1}/{args.num_epochs}], position {i},  Acc: {accuracies[i]:.2f}"
+            )
 
     dist.all_reduce(plosses, op=dist.ReduceOp.AVG, group=draft_fsdp_group)
     plosses = plosses.cpu().tolist()
     for i in range(len(plosses)):
         logdict[f"{mode}/ploss_{i}"] = plosses[i]
-        print_on_rank0(
-            f"Eval - Step {global_step} [{global_step + 1}/{args.num_epochs}], position {i}, pLoss: {plosses[i]}"
-        )
+        if dist.get_rank() == first_draft_rank:
+            print_with_rank(
+                f"Eval - Step {global_step} [{global_step + 1}/{args.num_epochs}], position {i}, pLoss: {plosses[i]}"
+            )
     tracker.log(logdict, step=global_step)
 
 
