@@ -203,11 +203,11 @@ def init_distributed_split(timeout: int = 10, tp_size: int = 1, draft_dp_size: i
     _DRAFT_DP_GROUP_SPLIT = my_dp_group
     _TRANSFER_GROUP = transfer_group
 
-    # Set DP_GROUP: for draft ranks use their DP group, for target ranks use target group
-    if rank in _DRAFT_RANKS:
-        _DP_GROUP = my_dp_group
-    else:
-        _DP_GROUP = target_group
+    # In split mode, _DP_GROUP is only used by DataLoader's DistributedSampler.
+    # All ranks use single-rank group → num_replicas=1 → all get same full dataset.
+    # - Target ranks: required for TP (all TP ranks must process same input)
+    # - Draft ranks: ensures step count matches target (draft receives data via transfer)
+    _DP_GROUP = my_sp_group
 
     print_with_rank(
         f"split mode: {'target' if rank in _TARGET_RANKS else 'draft'} rank, "
