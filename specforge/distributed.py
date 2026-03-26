@@ -193,7 +193,12 @@ def init_distributed_split(timeout: int = 10, tp_size: int = 1, draft_dp_size: i
 
     # Set globals
     _TP_GROUP = target_group
-    _TP_DEVICE_MESH = dist.DeviceMesh.from_group(target_group, device_type="cuda")
+    # DeviceMesh constructor is collective — all ranks must call it.
+    # Create a 1D mesh over target ranks only. Draft ranks participate in the
+    # collective but never use the resulting mesh.
+    _TP_DEVICE_MESH = dist.DeviceMesh(
+        "cuda", torch.tensor(_TARGET_RANKS, dtype=torch.int)
+    )
     _DRAFT_FSDP_GROUP = my_fsdp_group
     _DRAFT_DP_GROUP_SPLIT = my_dp_group
     _TRANSFER_GROUP = transfer_group
