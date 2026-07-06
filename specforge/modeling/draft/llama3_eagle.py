@@ -1,25 +1,46 @@
-import logging
 import math
+import warnings
 from typing import List, Optional, Tuple
 
 import torch
+import torch.distributed as dist
 import torch.nn as nn
 import torch.nn.functional as F
 from torch.nn.attention.flex_attention import create_block_mask, flex_attention
-from transformers import GenerationMixin, LlamaConfig, PreTrainedModel
 from transformers.activations import ACT2FN
 from transformers.cache_utils import Cache
 from transformers.models.llama.configuration_llama import LlamaConfig
+from yunchang.comm import SeqAllToAll4D
 
 from specforge.modeling.draft.flex_attention import (
     compile_friendly_create_block_mask,
     compile_friendly_flex_attention,
     generate_eagle3_mask,
 )
+from specforge.utils import print_with_rank
 
+from ...distributed import get_sp_ring_group, get_sp_ulysses_group
 from .base import Eagle3DraftModel
 
-logger = logging.getLogger(__name__)
+try:
+    from flash_attn import flash_attn_varlen_func as _std_flash_attn_varlen_func
+    from flash_attn.bert_padding import pad_input as _std_flash_pad_input
+    from flash_attn.bert_padding import unpad_input as _std_flash_unpad_input
+    from flash_attn.flash_attn_interface import (
+        _flash_attn_varlen_backward as _std_flash_attn_varlen_backward,
+    )
+except ImportError as exc:
+    warnings.warn(
+        "flash_attn is not found, falling back to flex_attention. "
+        "Please install flash_attn if you want to use the flash attention backend."
+    )
+    _std_flash_attn_varlen_func = None
+    _std_flash_pad_input = None
+    _std_flash_unpad_input = None
+    _std_flash_attn_varlen_backward = None
+    _std_flash_attn_import_error = exc
+else:
+    _std_flash_attn_import_error = None
 
 
 # Copied from transformers.models.bart.modeling_bart._make_causal_mask
@@ -92,12 +113,12 @@ def rotate_half(x):
 
 
 @torch.compile(dynamic=True)
-def apply_rotary_pos_emb(q, k, cos, sin, position_ids):
+def apply_rotary_pos_emb(q, k, cos, sin, position_ids, unsqueeze_dim=1):
     # The first two dimensions of cos and sin are always 1, so we can `squeeze` them.
     cos = cos.squeeze(1).squeeze(0)  # [seq_len, dim]
     sin = sin.squeeze(1).squeeze(0)  # [seq_len, dim]
-    cos = cos[position_ids].unsqueeze(1)  # [bs, 1, seq_len, dim]
-    sin = sin[position_ids].unsqueeze(1)  # [bs, 1, seq_len, dim]
+    cos = cos[position_ids].unsqueeze(unsqueeze_dim)  # [bs, 1, seq_len, dim]
+    sin = sin[position_ids].unsqueeze(unsqueeze_dim)  # [bs, 1, seq_len, dim]
     q_embed = (q * cos) + (rotate_half(q) * sin)
     k_embed = (k * cos) + (rotate_half(k) * sin)
     return q_embed, k_embed
@@ -177,7 +198,17 @@ def prepare_decoder_attention_mask(
 
 
 class LlamaRotaryEmbedding(torch.nn.Module):
-    def __init__(self, dim, max_position_embeddings=2048, base=10000, device=None):
+    def __init__(
+        self,
+        dim,
+        max_position_embeddings=2048,
+        base=10000,
+        device=None,
+        scaling_factor=None,
+        low_freq_factor=None,
+        high_freq_factor=None,
+        orig_max_position=None,
+    ):
         super().__init__()
 
         self.dim = dim
@@ -186,6 +217,46 @@ class LlamaRotaryEmbedding(torch.nn.Module):
         inv_freq = 1.0 / (
             self.base ** (torch.arange(0, self.dim, 2).float().to(device) / self.dim)
         )
+        # Llama3 style rotary embedding frequency scaling
+        if all(
+            v is not None
+            for v in [
+                scaling_factor,
+                low_freq_factor,
+                high_freq_factor,
+                orig_max_position,
+            ]
+        ):
+            print_with_rank(
+                f"Using Llama3 style rotary embedding with scaling_factor={scaling_factor}, low_freq_factor={low_freq_factor}, high_freq_factor={high_freq_factor}, orig_max_position={orig_max_position}"
+            )
+            self.scaling_factor = scaling_factor
+            self.low_freq_factor = low_freq_factor
+            self.high_freq_factor = high_freq_factor
+            self.orig_max_position = orig_max_position
+
+            low_freq_wavelen = orig_max_position / low_freq_factor
+            high_freq_wavelen = orig_max_position / high_freq_factor
+            wave_len = 2 * math.pi / inv_freq
+
+            if low_freq_factor != high_freq_factor:
+                smooth = (orig_max_position / wave_len - low_freq_factor) / (
+                    high_freq_factor - low_freq_factor
+                )
+            else:
+                smooth = 0
+
+            new_freqs = torch.where(
+                wave_len < high_freq_wavelen,
+                inv_freq,
+                torch.where(
+                    wave_len > low_freq_wavelen,
+                    inv_freq / self.scaling_factor,
+                    (1 - smooth) * inv_freq / self.scaling_factor + smooth * inv_freq,
+                ),
+            )
+            inv_freq = new_freqs
+
         self.register_buffer("inv_freq", inv_freq, persistent=False)
 
         # Build here to make `torch.jit.trace` work.
@@ -214,7 +285,7 @@ class LlamaRotaryEmbedding(torch.nn.Module):
     @torch.compile(dynamic=True)
     def forward(self, x, seq_len=None):
         # x: [bs, num_attention_heads, seq_len, head_size]
-        if seq_len > self.max_seq_len_cached:
+        if seq_len and seq_len > self.max_seq_len_cached:
             self._set_cos_sin_cache(seq_len=seq_len, device=x.device, dtype=x.dtype)
 
         return (
@@ -337,6 +408,116 @@ class LlamaMutiRotaryEmbedding(LlamaRotaryEmbedding):
         return cos.to(dtype=x.dtype), sin.to(dtype=x.dtype)
 
 
+# Inverse dim formula to find dim based on number of rotations
+def yarn_find_correction_dim(
+    num_rotations, dim, base=10000, max_position_embeddings=2048
+):
+    return (dim * math.log(max_position_embeddings / (num_rotations * 2 * math.pi))) / (
+        2 * math.log(base)
+    )
+
+
+# Find dim range bounds based on rotations
+def yarn_find_correction_range(
+    low_rot, high_rot, dim, base=10000, max_position_embeddings=2048
+):
+    low = math.floor(
+        yarn_find_correction_dim(low_rot, dim, base, max_position_embeddings)
+    )
+    high = math.ceil(
+        yarn_find_correction_dim(high_rot, dim, base, max_position_embeddings)
+    )
+    return max(low, 0), min(high, dim - 1)  # Clamp values just in case
+
+
+def yarn_get_mscale(scale=1, mscale=1):
+    if scale <= 1:
+        return 1.0
+    return 0.1 * mscale * math.log(scale) + 1.0
+
+
+def yarn_linear_ramp_mask(min_val, max_val, dim):
+    if min_val == max_val:
+        max_val += 0.001  # Prevent singularity
+    linear_func = (torch.arange(dim, dtype=torch.float32) - min_val) / (
+        max_val - min_val
+    )
+    ramp_func = torch.clamp(linear_func, 0, 1)
+    return ramp_func
+
+
+class LlamaYarnRotaryEmbedding(LlamaRotaryEmbedding):
+
+    def __init__(
+        self,
+        dim,
+        max_position_embeddings=2048,
+        base=10000,
+        device=None,
+        scaling_factor=1.0,
+        original_max_position_embeddings=4096,
+        beta_fast=32,
+        beta_slow=1,
+        mscale=1,
+        mscale_all_dim=0,
+    ):
+        self.scaling_factor = scaling_factor
+        self.original_max_position_embeddings = original_max_position_embeddings
+        self.beta_fast = beta_fast
+        self.beta_slow = beta_slow
+        self.mscale = mscale
+        self.mscale_all_dim = mscale_all_dim
+        super().__init__(dim, max_position_embeddings, base, device)
+
+    def _set_cos_sin_cache(self, seq_len, device, dtype):
+        self.max_seq_len_cached = seq_len
+        dim = self.dim
+
+        freq_extra = 1.0 / (
+            self.base
+            ** (torch.arange(0, dim, 2, dtype=torch.float32, device=device) / dim)
+        )
+        freq_inter = 1.0 / (
+            self.scaling_factor
+            * self.base
+            ** (torch.arange(0, dim, 2, dtype=torch.float32, device=device) / dim)
+        )
+
+        low, high = yarn_find_correction_range(
+            self.beta_fast,
+            self.beta_slow,
+            dim,
+            self.base,
+            self.original_max_position_embeddings,
+        )
+        inv_freq_mask = 1.0 - yarn_linear_ramp_mask(low, high, dim // 2).to(
+            device=device, dtype=torch.float32
+        )
+        inv_freq = freq_inter * (1 - inv_freq_mask) + freq_extra * inv_freq_mask
+        self.register_buffer("inv_freq", inv_freq, persistent=False)
+
+        t = torch.arange(seq_len, device=device, dtype=torch.float32)
+
+        freqs = torch.outer(t, inv_freq)
+
+        _mscale = float(
+            yarn_get_mscale(self.scaling_factor, self.mscale)
+            / yarn_get_mscale(self.scaling_factor, self.mscale_all_dim)
+        )
+
+        emb = torch.cat((freqs, freqs), dim=-1)
+        self.register_buffer(
+            "cos_cached",
+            (emb.cos() * _mscale)[None, None, :, :].to(dtype),
+            persistent=False,
+        )
+        self.register_buffer(
+            "sin_cached",
+            (emb.sin() * _mscale)[None, None, :, :].to(dtype),
+            persistent=False,
+        )
+
+
 class LlamaAttention(nn.Module):
     """Multi-headed attention from 'Attention Is All You Need' paper"""
 
@@ -370,19 +551,43 @@ class LlamaAttention(nn.Module):
     def _init_rope(self):
         if self.config.rope_scaling is None:
             self.rotary_emb = LlamaRotaryEmbedding(
-                self.head_dim, max_position_embeddings=self.max_position_embeddings
+                self.head_dim,
+                max_position_embeddings=self.max_position_embeddings,
+                base=getattr(self.config, "rope_theta", 10000),
             )
         else:
-            scaling_type = self.config.rope_scaling["rope_type"]
-            if hasattr(self.config.rope_scaling, "factor"):
-                scaling_factor = self.config.rope_scaling["factor"]
-            if scaling_type == "linear":
+            rope_scaling = self.config.rope_scaling
+
+            def rope_get(key, default=None):
+                if isinstance(rope_scaling, dict):
+                    return rope_scaling.get(key, default)
+                return getattr(rope_scaling, key, default)
+
+            scaling_type = rope_get("rope_type", rope_get("type"))
+            scaling_factor = rope_get("factor")
+
+            if scaling_type == "default":
+                self.rotary_emb = LlamaRotaryEmbedding(
+                    self.head_dim,
+                    max_position_embeddings=self.max_position_embeddings,
+                    base=getattr(self.config, "rope_theta", 10000),
+                )
+                return
+            elif scaling_type == "linear":
+                if scaling_factor is None:
+                    raise ValueError(
+                        "Linear RoPE scaling requires 'factor' in rope_scaling config."
+                    )
                 self.rotary_emb = LlamaLinearScalingRotaryEmbedding(
                     self.head_dim,
                     max_position_embeddings=self.max_position_embeddings,
                     scaling_factor=scaling_factor,
                 )
             elif scaling_type == "dynamic":
+                if scaling_factor is None:
+                    raise ValueError(
+                        "Dynamic RoPE scaling requires 'factor' in rope_scaling config."
+                    )
                 self.rotary_emb = LlamaDynamicNTKScalingRotaryEmbedding(
                     self.head_dim,
                     max_position_embeddings=self.max_position_embeddings,
@@ -391,11 +596,32 @@ class LlamaAttention(nn.Module):
             elif scaling_type == "llama3":
                 # for nv type
                 self.rotary_emb = LlamaRotaryEmbedding(
-                    self.head_dim, max_position_embeddings=self.max_position_embeddings
+                    self.head_dim,
+                    max_position_embeddings=self.max_position_embeddings,
+                    base=getattr(self.config, "rope_theta", 10000),
+                    scaling_factor=(
+                        scaling_factor if scaling_factor is not None else 1.0
+                    ),
+                    low_freq_factor=rope_get("low_freq_factor"),
+                    high_freq_factor=rope_get("high_freq_factor"),
+                    orig_max_position=rope_get("original_max_position_embeddings"),
                 )
             elif scaling_type == "mrope":
                 self.rotary_emb = LlamaMutiRotaryEmbedding(
                     self.head_dim, max_position_embeddings=self.max_position_embeddings
+                )
+            elif scaling_type == "yarn":
+                self.rotary_emb = LlamaYarnRotaryEmbedding(
+                    self.head_dim,
+                    max_position_embeddings=self.max_position_embeddings,
+                    original_max_position_embeddings=rope_get(
+                        "original_max_position_embeddings"
+                    ),
+                    scaling_factor=scaling_factor,
+                    beta_fast=rope_get("beta_fast"),
+                    beta_slow=rope_get("beta_slow"),
+                    mscale=rope_get("mscale"),
+                    mscale_all_dim=rope_get("mscale_all_dim"),
                 )
             else:
                 raise ValueError(f"Unknown RoPE scaling type {scaling_type}")
@@ -479,7 +705,7 @@ class LlamaAttention(nn.Module):
                 cos, sin = self.rotary_emb(query_states, seq_len=q_len + lck)
                 cos, sin = cos.to(query_states.device), sin.to(query_states.device)
                 query_states, key_states = apply_rotary_pos_emb(
-                    query_states, key_states, cos, sin, position_ids
+                    query_states, key_states, cos, sin, position_ids + lck
                 )
 
             key_states = repeat_kv(key_states, self.num_key_value_groups)
@@ -623,7 +849,7 @@ class LlamaFlexAttention(LlamaAttention):
                 seq_lengths=seq_lengths,
                 Q_LEN=q_len,
                 KV_LEN=key_cache.shape[-2],
-                shift_left=lck,
+                lck=lck,
             ),
             B=bsz,
             H=1,  # Rely on broadcast
@@ -641,6 +867,614 @@ class LlamaFlexAttention(LlamaAttention):
         attn_output = attn_output.transpose(1, 2).contiguous()
         attn_output = attn_output.reshape(bsz, q_len, self.head_dim * self.num_heads)
         attn_output = self.o_proj(attn_output)
+        return attn_output
+
+
+def _raise_standard_flash_attn_unavailable() -> None:
+    raise RuntimeError(
+        "LlamaFlashAttention requires the standard flash-attn interface "
+        f"(import error: {_std_flash_attn_import_error!r})"
+    )
+
+
+def _standard_flash_attn_varlen_forward(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    attention_mask: torch.Tensor,
+    softmax_scale: float,
+    causal: bool,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    q_unpad, indices_q, cu_seqlens_q, max_seqlen_q, _ = _std_flash_unpad_input(
+        q, attention_mask
+    )
+    k_unpad, _, cu_seqlens_k, max_seqlen_k, _ = _std_flash_unpad_input(
+        k, attention_mask
+    )
+    v_unpad, _, _, _, _ = _std_flash_unpad_input(v, attention_mask)
+    out_unpad, lse_unpad, _ = _std_flash_attn_varlen_func(
+        q_unpad,
+        k_unpad,
+        v_unpad,
+        cu_seqlens_q,
+        cu_seqlens_k,
+        max_seqlen_q,
+        max_seqlen_k,
+        dropout_p=0.0,
+        softmax_scale=softmax_scale,
+        causal=causal,
+        return_attn_probs=True,
+    )
+    out = _std_flash_pad_input(out_unpad, indices_q, q.shape[0], q.shape[1])
+    lse_padded = _std_flash_pad_input(
+        lse_unpad.transpose(0, 1), indices_q, q.shape[0], q.shape[1]
+    ).transpose(1, 2)
+    return out, lse_padded, indices_q, cu_seqlens_q
+
+
+def _standard_flash_attn_varlen_backward_call(
+    dout: torch.Tensor,
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    out: torch.Tensor,
+    softmax_lse: torch.Tensor,
+    attention_mask: torch.Tensor,
+    dq: torch.Tensor,
+    dk: torch.Tensor,
+    dv: torch.Tensor,
+    softmax_scale: float,
+    causal: bool,
+) -> None:
+    q_unpad, indices_q, cu_seqlens_q, max_seqlen_q, _ = _std_flash_unpad_input(
+        q, attention_mask
+    )
+    k_unpad, indices_k, cu_seqlens_k, max_seqlen_k, _ = _std_flash_unpad_input(
+        k, attention_mask
+    )
+    v_unpad, _, _, _, _ = _std_flash_unpad_input(v, attention_mask)
+    dout_unpad, _, _, _, _ = _std_flash_unpad_input(dout, attention_mask)
+    out_unpad, _, _, _, _ = _std_flash_unpad_input(out, attention_mask)
+    lse_unpad, _, _, _, _ = _std_flash_unpad_input(
+        softmax_lse.transpose(1, 2), attention_mask
+    )
+    lse_unpad = lse_unpad.transpose(0, 1).contiguous()
+
+    dq_unpad = torch.empty_like(q_unpad)
+    dk_unpad = torch.empty_like(k_unpad)
+    dv_unpad = torch.empty_like(v_unpad)
+    _std_flash_attn_varlen_backward(
+        dout_unpad,
+        q_unpad,
+        k_unpad,
+        v_unpad,
+        out_unpad,
+        lse_unpad,
+        dq_unpad,
+        dk_unpad,
+        dv_unpad,
+        cu_seqlens_q,
+        cu_seqlens_k,
+        max_seqlen_q,
+        max_seqlen_k,
+        0.0,
+        softmax_scale,
+        causal,
+        -1,
+        -1,
+        0.0,
+        None,
+        False,
+        None,
+    )
+    dq.copy_(_std_flash_pad_input(dq_unpad, indices_q, q.shape[0], q.shape[1]))
+    dk.copy_(_std_flash_pad_input(dk_unpad, indices_k, k.shape[0], k.shape[1]))
+    dv.copy_(_std_flash_pad_input(dv_unpad, indices_k, v.shape[0], v.shape[1]))
+
+
+def _cached_merge_dims(q: torch.Tensor, cache_k: torch.Tensor):
+    bsz, q_len, num_heads, head_dim = q.shape
+    num_blocks = cache_k.shape[1]
+    num_kv_heads = cache_k.shape[3]
+    num_groups = num_heads // num_kv_heads
+    return bsz, q_len, num_heads, head_dim, num_blocks, num_kv_heads, num_groups
+
+
+def _kernel_lse(lse: torch.Tensor, bsz: int, q_len: int, num_heads: int):
+    return lse.reshape(bsz, q_len, num_heads).transpose(1, 2).contiguous()
+
+
+def _current_valid_lengths(
+    attention_mask: Optional[torch.Tensor],
+    bsz: int,
+    q_len: int,
+    lck: int,
+    device: torch.device,
+) -> torch.Tensor:
+    if attention_mask is None or attention_mask.dim() != 2:
+        return torch.full((bsz,), q_len, dtype=torch.long, device=device)
+    return attention_mask.sum(dim=-1, dtype=torch.long).sub(lck).clamp_(0, q_len)
+
+
+class _FlashCachedMergeFunc(torch.autograd.Function):
+    @staticmethod
+    def forward(ctx, q, cache_k, cache_v, valid_lengths, softmax_scale: float):
+        bsz, q_len, num_heads, head_dim, num_blocks, num_kv_heads, num_groups = (
+            _cached_merge_dims(q, cache_k)
+        )
+        q_expanded = q.view(bsz, q_len, num_kv_heads, num_groups, head_dim)
+        valid_lengths = valid_lengths.to(device=q.device, dtype=torch.long).clamp_(
+            0, q_len
+        )
+        valid_mask = (
+            torch.arange(q_len, device=q.device).unsqueeze(0)
+            < valid_lengths.unsqueeze(1)
+        ).view(bsz, q_len, 1, 1)
+        attention_mask = valid_mask.view(bsz, q_len)
+
+        k0 = cache_k[:, 0].contiguous()
+        v0 = cache_v[:, 0].contiguous()
+        out0, lse0_kernel, _, _ = _standard_flash_attn_varlen_forward(
+            q.contiguous(),
+            k0,
+            v0,
+            attention_mask,
+            softmax_scale=softmax_scale,
+            causal=True,
+        )
+        out0_expanded = out0.view(
+            bsz, q_len, num_kv_heads, num_groups, head_dim
+        ).float()
+        neg_inf = float("-inf")
+        lse0 = (
+            lse0_kernel.transpose(1, 2)
+            .view(bsz, q_len, num_kv_heads, num_groups)
+            .float()
+        )
+        lse0 = torch.where(valid_mask, lse0, neg_inf)
+        lse_terms = [lse0]
+        attn_terms = [out0_expanded]
+        for i in range(1, num_blocks):
+            ki = cache_k[:, i].unsqueeze(-2).float()
+            vi = cache_v[:, i].unsqueeze(-2).float()
+            lse_i = (q_expanded.float() * ki).sum(-1) * softmax_scale
+            lse_terms.append(torch.where(valid_mask, lse_i, neg_inf))
+            attn_terms.append(vi.expand_as(out0_expanded))
+
+        merged_lse = torch.logsumexp(torch.stack(lse_terms, dim=-1), dim=-1)
+        out = sum(
+            term * torch.exp(lse - merged_lse).unsqueeze(-1)
+            for term, lse in zip(attn_terms, lse_terms)
+        )
+        out = torch.where(valid_mask.unsqueeze(-1), out, 0.0)
+        merged_lse = torch.where(valid_mask, merged_lse, 0.0)
+        ctx.save_for_backward(q, cache_k, cache_v, out, merged_lse, valid_lengths)
+        ctx.softmax_scale = softmax_scale
+        return out.to(q.dtype).reshape_as(q)
+
+    @staticmethod
+    def backward(ctx, grad_out):
+        q, cache_k, cache_v, out, merged_lse, valid_lengths = ctx.saved_tensors
+        bsz, q_len, num_heads, head_dim, num_blocks, num_kv_heads, num_groups = (
+            _cached_merge_dims(q, cache_k)
+        )
+        scale = ctx.softmax_scale
+        if grad_out.ndim == 3:
+            grad_out = grad_out.view(bsz, q_len, num_heads, head_dim)
+        valid_lengths = valid_lengths.to(device=q.device, dtype=torch.long)
+        valid_mask = (
+            torch.arange(q_len, device=q.device).unsqueeze(0)
+            < valid_lengths.unsqueeze(1)
+        ).view(bsz, q_len, 1, 1)
+        attention_mask = valid_mask.view(bsz, q_len)
+        grad_out = torch.where(valid_mask, grad_out, 0.0)
+
+        grad_out_f = grad_out.float().view(
+            bsz, q_len, num_kv_heads, num_groups, head_dim
+        )
+        q_f = q.float()
+        q_expanded = q_f.view(bsz, q_len, num_kv_heads, num_groups, head_dim)
+        out_f = out.float()
+        out_expanded = out_f.view(bsz, q_len, num_kv_heads, num_groups, head_dim)
+        out_q = out.to(q.dtype).reshape(bsz, q_len, num_heads, head_dim)
+
+        dq = torch.zeros_like(q_f)
+        dcache_k = torch.zeros_like(cache_k.float())
+        dcache_v = torch.zeros_like(cache_v.float())
+
+        dq0 = torch.zeros_like(q)
+        dk0 = torch.zeros_like(cache_k[:, 0])
+        dv0 = torch.zeros_like(cache_v[:, 0])
+        merged_lse_kernel = _kernel_lse(merged_lse, bsz, q_len, num_heads)
+        _standard_flash_attn_varlen_backward_call(
+            grad_out.contiguous(),
+            q.contiguous(),
+            cache_k[:, 0].contiguous(),
+            cache_v[:, 0].contiguous(),
+            out_q.contiguous(),
+            merged_lse_kernel,
+            attention_mask,
+            dq0,
+            dk0,
+            dv0,
+            softmax_scale=scale,
+            causal=True,
+        )
+        dq += dq0.float()
+        dcache_k[:, 0] += dk0.float()
+        dcache_v[:, 0] += dv0.float()
+
+        for i in range(1, num_blocks):
+            ki = cache_k[:, i].float().unsqueeze(-2)
+            vi = cache_v[:, i].float().unsqueeze(-2)
+            lse_i = (q_expanded * ki).sum(-1) * scale
+            wi = torch.where(valid_mask, torch.exp(lse_i - merged_lse), 0.0)
+            d_out_i = grad_out_f * wi.unsqueeze(-1)
+            d_lse_i = wi * (
+                grad_out_f * (vi.expand_as(out_expanded) - out_expanded)
+            ).sum(-1)
+            dq += (d_lse_i.unsqueeze(-1) * scale * ki).reshape_as(q)
+            dcache_k[:, i] += (d_lse_i.unsqueeze(-1) * scale * q_expanded).sum(dim=3)
+            dcache_v[:, i] += d_out_i.sum(dim=3)
+
+        return (
+            dq.to(q.dtype),
+            dcache_k.to(cache_k.dtype),
+            dcache_v.to(cache_v.dtype),
+            None,
+            None,
+        )
+
+
+def _update_ring_out_and_lse(
+    out: torch.Tensor | None,
+    lse: torch.Tensor | None,
+    block_out: torch.Tensor,
+    block_lse: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    block_out = block_out.float()
+    block_lse = block_lse.float()
+    if out is None or lse is None:
+        return block_out, block_lse
+    new_lse = torch.logaddexp(lse, block_lse)
+    out = out * torch.exp(lse - new_lse).unsqueeze(-1) + block_out * torch.exp(
+        block_lse - new_lse
+    ).unsqueeze(-1)
+    return out, new_lse
+
+
+class _USPRingFlashCachedMergeFunc(torch.autograd.Function):
+    @staticmethod
+    def forward(
+        ctx, q, cache_k, cache_v, ring_group: dist.ProcessGroup, softmax_scale: float
+    ):
+        from specforge.layers.ring.ring_flash_attn import ring_flash_attn_forward
+
+        bsz, q_len, num_heads, head_dim, num_blocks, num_kv_heads, num_groups = (
+            _cached_merge_dims(q, cache_k)
+        )
+        q_expanded = q.view(bsz, q_len, num_kv_heads, num_groups, head_dim)
+
+        out_ring, lse_ring = ring_flash_attn_forward(
+            ring_group,
+            q.contiguous(),
+            cache_k[:, 0].contiguous(),
+            cache_v[:, 0].contiguous(),
+            softmax_scale=softmax_scale,
+            dropout_p=0.0,
+            causal=True,
+            window_size=(-1, -1),
+            alibi_slopes=None,
+            deterministic=False,
+        )
+        if lse_ring.dim() == 3 and lse_ring.shape[1] == num_heads:
+            lse_ring = lse_ring.transpose(1, 2)
+        acc_out = out_ring.view(bsz, q_len, num_kv_heads, num_groups, head_dim)
+        acc_lse = lse_ring.reshape(bsz, q_len, num_kv_heads, num_groups)
+
+        for i in range(1, num_blocks):
+            ki = cache_k[:, i].unsqueeze(-2).float()
+            vi = cache_v[:, i].unsqueeze(-2).float()
+            lse_i = (q_expanded.float() * ki).sum(-1) * softmax_scale
+            out_i = vi.expand(bsz, q_len, num_kv_heads, num_groups, head_dim)
+            acc_out, acc_lse = _update_ring_out_and_lse(acc_out, acc_lse, out_i, lse_i)
+
+        ctx.save_for_backward(q, cache_k, cache_v, acc_out, acc_lse)
+        ctx.ring_group = ring_group
+        ctx.softmax_scale = softmax_scale
+        return acc_out.to(q.dtype).reshape_as(q)
+
+    @staticmethod
+    def backward(ctx, grad_out):
+        from specforge.layers.ring.ring_flash_attn import ring_flash_attn_backward
+
+        q, cache_k, cache_v, out, merged_lse = ctx.saved_tensors
+        bsz, q_len, num_heads, head_dim, num_blocks, num_kv_heads, num_groups = (
+            _cached_merge_dims(q, cache_k)
+        )
+        scale = ctx.softmax_scale
+
+        if grad_out.ndim == 3:
+            grad_out = grad_out.view(bsz, q_len, num_heads, head_dim)
+        grad_out_f = grad_out.float().view(
+            bsz, q_len, num_kv_heads, num_groups, head_dim
+        )
+        q_f = q.float()
+        q_expanded = q_f.view(bsz, q_len, num_kv_heads, num_groups, head_dim)
+        out_expanded = out.float().view(bsz, q_len, num_kv_heads, num_groups, head_dim)
+
+        dcache_k = torch.zeros_like(cache_k.float())
+        dcache_v = torch.zeros_like(cache_v.float())
+        merged_lse_kernel = _kernel_lse(merged_lse, bsz, q_len, num_heads)
+        dq, dk0, dv0 = ring_flash_attn_backward(
+            ctx.ring_group,
+            grad_out.contiguous(),
+            q.contiguous(),
+            cache_k[:, 0].contiguous(),
+            cache_v[:, 0].contiguous(),
+            out.to(q.dtype).reshape_as(q).contiguous(),
+            merged_lse_kernel,
+            softmax_scale=scale,
+            dropout_p=0.0,
+            causal=True,
+            window_size=(-1, -1),
+            alibi_slopes=None,
+            deterministic=False,
+        )
+        dq = dq.float()
+        dcache_k[:, 0] = dk0.float()
+        dcache_v[:, 0] = dv0.float()
+
+        for i in range(1, num_blocks):
+            ki = cache_k[:, i].float().unsqueeze(-2)
+            vi = cache_v[:, i].float().unsqueeze(-2)
+            lse_i = (q_expanded * ki).sum(-1) * scale
+            wi = torch.exp(lse_i - merged_lse)
+            d_out_i = grad_out_f * wi.unsqueeze(-1)
+            d_lse_i = wi * (
+                grad_out_f * (vi.expand_as(out_expanded) - out_expanded)
+            ).sum(-1)
+            dq += (d_lse_i.unsqueeze(-1) * scale * ki).reshape_as(q)
+            dcache_k[:, i] += (d_lse_i.unsqueeze(-1) * scale * q_expanded).sum(dim=3)
+            dcache_v[:, i] += d_out_i.sum(dim=3)
+
+        return (
+            dq.to(q.dtype),
+            dcache_k.to(cache_k.dtype),
+            dcache_v.to(cache_v.dtype),
+            None,
+            None,
+        )
+
+
+class LlamaFlashAttention(LlamaAttention):
+    """
+    Attention layer implemented with flash attention. We keep the parameters consistent with LlamaAttention.
+    The used parameters are:
+        - hidden_states: input hidden states
+        - position_ids: position ids
+        - cache_hidden: manual cache used for storing past key and value states
+    """
+
+    def __init__(self, config):
+        super().__init__(config)
+        if (
+            _std_flash_attn_varlen_func is None
+            or _std_flash_attn_varlen_backward is None
+            or _std_flash_unpad_input is None
+            or _std_flash_pad_input is None
+        ):
+            _raise_standard_flash_attn_unavailable()
+
+    def forward(
+        self,
+        hidden_states: torch.Tensor,
+        cache_hidden: Optional[List[torch.Tensor]] = None,
+        attention_mask: Optional[torch.Tensor] = None,
+        position_ids: Optional[torch.LongTensor] = None,
+        past_key_values: Optional[Cache] = None,
+        output_attentions: bool = False,
+        use_cache: bool = False,
+    ) -> Tuple[torch.Tensor, Optional[torch.Tensor], Optional[Tuple[torch.Tensor]]]:
+        bsz, q_len, _ = hidden_states.size()
+
+        query_states = self.q_proj(hidden_states)
+        key_states = self.k_proj(hidden_states)
+        value_states = self.v_proj(hidden_states)
+
+        query_states = query_states.view(bsz, q_len, self.num_heads, self.head_dim)
+        key_states = key_states.view(
+            bsz, q_len, self.num_key_value_heads, self.head_dim
+        )
+        value_states = value_states.view(
+            bsz, q_len, self.num_key_value_heads, self.head_dim
+        )
+
+        lck = 0 if cache_hidden is None else len(cache_hidden[0])
+        if isinstance(self.rotary_emb, LlamaMutiRotaryEmbedding):
+            cos, sin = self.rotary_emb(query_states, position_ids + lck)
+            cos, sin = cos.to(query_states.device), sin.to(query_states.device)
+            query_states, key_states = apply_multimodal_rotary_pos_emb(
+                query_states,
+                key_states,
+                cos,
+                sin,
+                self.config.rope_scaling["mrope_section"],
+                unsqueeze_dim=2,
+            )
+        else:
+            cos, sin = self.rotary_emb(query_states, seq_len=q_len + lck)
+            cos, sin = cos.to(query_states.device), sin.to(query_states.device)
+            query_states, key_states = apply_rotary_pos_emb(
+                query_states, key_states, cos, sin, position_ids + lck, unsqueeze_dim=2
+            )
+
+        if cache_hidden is not None:
+            cache_hidden[0] = cache_hidden[0] + [key_states]
+            cache_hidden[1] = cache_hidden[1] + [value_states]
+            cache_k = cache_hidden[0]
+            cache_v = cache_hidden[1]
+        else:
+            cache_k = [key_states]
+            cache_v = [value_states]
+
+        valid_lengths = _current_valid_lengths(
+            attention_mask, bsz, q_len, lck, query_states.device
+        )
+
+        attn_output = _FlashCachedMergeFunc.apply(
+            query_states,
+            torch.stack(cache_k, dim=1),
+            torch.stack(cache_v, dim=1),
+            valid_lengths,
+            1.0 / math.sqrt(self.head_dim),
+        )
+
+        attn_output = attn_output.reshape(bsz, q_len, self.head_dim * self.num_heads)
+        attn_output = self.o_proj(attn_output)
+        return attn_output
+
+
+class LlamaUSPFlashAttention(LlamaAttention):
+    """
+    LlamaUSPFlashAttention with Trainable Ring Attention & Correct Eagle3 Branch Merging.
+    """
+
+    def __init__(self, config):
+        super().__init__(config)
+        assert (
+            dist.is_initialized()
+        ), f"LlamaUSPAttention requires torch.distributed; call init_distributed first."
+        if isinstance(self.rotary_emb, LlamaMutiRotaryEmbedding):
+            raise NotImplementedError(
+                f"LlamaMutiRotaryEmbedding is currently not supported for LlamaUSPFlashAttention."
+            )
+        self.ring_pg = get_sp_ring_group()
+        self.ulysses_pg = get_sp_ulysses_group()
+        self.sp_ring_degree = torch.distributed.get_world_size(self.ring_pg)
+        self.sp_ulysses_degree = torch.distributed.get_world_size(self.ulysses_pg)
+        self.ring_rank = torch.distributed.get_rank(self.ring_pg)
+
+        self.scatter_idx = 2
+        self.gather_idx = 1
+        self.use_sync = False
+
+    def forward(
+        self,
+        hidden_states: torch.Tensor,
+        cache_hidden: Optional[List[torch.Tensor]] = None,
+        attention_mask: Optional[torch.Tensor] = None,
+        position_ids: Optional[torch.LongTensor] = None,
+        past_key_values: Optional[Cache] = None,
+        output_attentions: bool = False,
+        use_cache: bool = False,
+    ) -> Tuple[torch.Tensor, Optional[torch.Tensor], Optional[Tuple[torch.Tensor]]]:
+
+        bsz, q_len, _ = hidden_states.size()
+        local_q_len = q_len
+
+        # =============================================================
+        # 1. Projections & Ulysses Scatter
+        # =============================================================
+        query_states = self.q_proj(hidden_states)
+        query_states = query_states.view(bsz, q_len, self.num_heads, self.head_dim)
+        query_states = SeqAllToAll4D.apply(
+            self.ulysses_pg,
+            query_states,
+            self.scatter_idx,
+            self.gather_idx,
+            self.use_sync,
+        )
+
+        key_states = self.k_proj(hidden_states)
+        key_states = key_states.view(
+            bsz, q_len, self.num_key_value_heads, self.head_dim
+        )
+        key_states = SeqAllToAll4D.apply(
+            self.ulysses_pg,
+            key_states,
+            self.scatter_idx,
+            self.gather_idx,
+            self.use_sync,
+        )
+
+        value_states = self.v_proj(hidden_states)
+        value_states = value_states.view(
+            bsz, q_len, self.num_key_value_heads, self.head_dim
+        )
+        value_states = SeqAllToAll4D.apply(
+            self.ulysses_pg,
+            value_states,
+            self.scatter_idx,
+            self.gather_idx,
+            self.use_sync,
+        )
+
+        # Global length calculation (for RoPE)
+        global_q_len = q_len * self.sp_ring_degree * self.sp_ulysses_degree
+        # =============================================================
+        # 2. RoPE & Cache Management
+        # =============================================================
+        lck = 0 if cache_hidden is None else len(cache_hidden[0])
+
+        cos, sin = self.rotary_emb(query_states, seq_len=global_q_len + lck)
+        cos, sin = cos.to(query_states.device), sin.to(query_states.device)
+        query_states, key_states = apply_rotary_pos_emb(
+            query_states, key_states, cos, sin, position_ids + lck, unsqueeze_dim=2
+        )
+
+        # Update Cache (Eagle3 Logic: Cache is a list of tensors for tree branches)
+        if cache_hidden is not None:
+            cache_hidden[0] = cache_hidden[0] + [key_states]
+            cache_hidden[1] = cache_hidden[1] + [value_states]
+            cache_k = cache_hidden[0]
+            cache_v = cache_hidden[1]
+        else:
+            cache_k = [key_states]
+            cache_v = [value_states]
+
+        softmax_scale = 1.0 / math.sqrt(self.head_dim)
+        cache_k_tensor = torch.stack(cache_k, dim=1)
+        cache_v_tensor = torch.stack(cache_v, dim=1)
+        if self.sp_ring_degree > 1:
+            attn_output = _USPRingFlashCachedMergeFunc.apply(
+                query_states,
+                cache_k_tensor,
+                cache_v_tensor,
+                self.ring_pg,
+                softmax_scale,
+            )
+        else:
+            valid_lengths = torch.full(
+                (bsz,),
+                query_states.shape[1],
+                dtype=torch.long,
+                device=query_states.device,
+            )
+            attn_output = _FlashCachedMergeFunc.apply(
+                query_states,
+                cache_k_tensor,
+                cache_v_tensor,
+                valid_lengths,
+                softmax_scale,
+            )
+
+        # =============================================================
+        # 4. Ulysses Gather & Output Projection
+        # =============================================================
+        attn_output = SeqAllToAll4D.apply(
+            self.ulysses_pg,
+            attn_output,
+            self.gather_idx,  # Scatter idx: 1 (Seq)
+            self.scatter_idx,  # Gather idx: 2 (Heads)
+            self.use_sync,
+        )
+
+        attn_output = attn_output.reshape(
+            bsz, local_q_len, self.head_dim * self.num_heads
+        )
+        attn_output = self.o_proj(attn_output)
+
         return attn_output
 
 
@@ -715,11 +1549,16 @@ class LlamaDecoderLayer(nn.Module):
         if attention_backend == "sdpa":
             self.self_attn = LlamaAttention(config=config)
         elif attention_backend == "flex_attention":
-            logger.warning("Using flex attention on draft model training!")
+            print_with_rank("Using flex attention on draft model training!")
             self.self_attn = LlamaFlexAttention(config=config)
+        elif attention_backend == "fa":
+            self.self_attn = LlamaFlashAttention(config=config)
+        elif attention_backend == "usp":
+            self.self_attn = LlamaUSPFlashAttention(config=config)
         else:
             raise ValueError(f"Unknown attention backend {attention_backend}")
 
+        self.attention_backend = attention_backend
         self.mlp = LlamaMLP(config)
         # self.fc = nn.Linear(config.hidden_size * 2, config.hidden_size)
         self.hidden_norm = LlamaRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
@@ -816,10 +1655,12 @@ class LlamaForCausalLMEagle3(Eagle3DraftModel):
         )
 
         # create vocab buffers
-        t2d = torch.zeros(self.vocab_size, dtype=torch.bool)
+        t2d = torch.ones(self.vocab_size, dtype=torch.bool)
         d2t = torch.zeros(self.draft_vocab_size, dtype=torch.int64)
         self.register_buffer("t2d", t2d)
         self.register_buffer("d2t", d2t)
+
+        self.post_init()
 
     def forward(
         self,
@@ -837,10 +1678,10 @@ class LlamaForCausalLMEagle3(Eagle3DraftModel):
             position_ids (`torch.LongTensor`, *optional*): position ids of shape `(batch, seq_len)`
         """
         if ttt_length == 1:
-            logger.info("using ttt_length 1, no need to cache hidden states")
+            print_with_rank("using ttt_length 1, no need to cache hidden states")
             cache_hidden = None
         else:
-            logger.info(f"using ttt_length {ttt_length}, caching hidden states")
+            print_with_rank(f"using ttt_length {ttt_length}, caching hidden states")
             cache_hidden = [[], []]
 
         batch_size, seq_length, _ = hidden_states.size()

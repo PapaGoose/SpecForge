@@ -60,21 +60,18 @@ class Tracker(abc.ABC):
         This method is called during argument parsing.
         It should raise an error if required arguments are missing.
         """
-        pass
 
     @abc.abstractmethod
     def log(self, log_dict: Dict[str, Any], step: Optional[int] = None) -> None:
         """
         Log metrics to the tracker.
         """
-        pass
 
     @abc.abstractmethod
     def close(self) -> None:
         """
         Close the tracker and clean up resources.
         """
-        pass
 
 
 class NoOpTracker(Tracker):
@@ -106,24 +103,20 @@ class ClearmlTracker(Tracker):
             )
 
         if args.clearml_project_name is None:
-            parser.error(
-                "Set project_name for your Task"
-            )
+            parser.error("Set --clearml-project-name for your Task")
 
         if args.clearml_jira_task is None:
-            parser.error(
-                "Set jira_task for your Task"
-            )
+            parser.error("Set --clearml-jira-task for your Task")
 
     def __init__(self, args, output_dir: str):
         super().__init__(args, output_dir)
         if self.rank == 0:
             self.task = clearml.Task.init(
-                project_name=args.clearm_project_name,
-                task_name=f'[{clearml_jira_task}] Spec Dec Training',
-                output_uri='s3://storage.yandexcloud.net:443/clearml-fndrs/experiments',
+                project_name=args.clearml_project_name,
+                task_name=f"[{args.clearml_jira_task}] Spec Dec Training",
+                output_uri="s3://storage.yandexcloud.net:443/clearml-fndrs/experiments",
                 reuse_last_task_id=False,
-                auto_connect_frameworks=False
+                auto_connect_frameworks=False,
             )
             self.is_initialized = True
 
@@ -131,7 +124,9 @@ class ClearmlTracker(Tracker):
         if self.rank == 0 and self.is_initialized:
             for key, value in log_dict.items():
                 if isinstance(value, (int, float)):
-                    clearml.Logger.current_logger().report_scalar(series=key, value=value, iteration=step)
+                    clearml.Logger.current_logger().report_scalar(
+                        title=key, series=key, value=value, iteration=step
+                    )
 
     def close(self):
         if self.rank == 0 and self.is_initialized:
@@ -139,9 +134,13 @@ class ClearmlTracker(Tracker):
             self.is_initialized = False
 
 
-
 class WandbTracker(Tracker):
     """Tracks experiments using Weights & Biases."""
+
+    @staticmethod
+    def _default_wandb_dir() -> str:
+        # specforge/tracker.py -> project root is one level up
+        return os.path.normpath(os.path.join(os.path.dirname(__file__), "..", "wandb"))
 
     @classmethod
     def validate_args(cls, parser, args):
@@ -149,6 +148,12 @@ class WandbTracker(Tracker):
             parser.error(
                 "To use --report-to wandb, you must install wandb: 'pip install wandb'"
             )
+
+        if args.wandb_dir is None:
+            args.wandb_dir = cls._default_wandb_dir()
+
+        if args.wandb_offline:
+            return
 
         if args.wandb_key is not None:
             return
@@ -180,10 +185,21 @@ class WandbTracker(Tracker):
     def __init__(self, args, output_dir: str):
         super().__init__(args, output_dir)
         if self.rank == 0:
-            wandb.login(key=args.wandb_key)
-            wandb.init(
-                project=args.wandb_project, name=args.wandb_name, config=vars(args)
-            )
+            if args.wandb_dir is None:
+                args.wandb_dir = self._default_wandb_dir()
+            os.makedirs(args.wandb_dir, exist_ok=True)
+
+            if not args.wandb_offline:
+                wandb.login(key=args.wandb_key)
+            init_kwargs = {
+                "project": args.wandb_project,
+                "name": args.wandb_name,
+                "config": vars(args),
+                "dir": args.wandb_dir,
+            }
+            if args.wandb_offline:
+                init_kwargs["mode"] = "offline"
+            wandb.init(**init_kwargs)
             self.is_initialized = True
 
     def log(self, log_dict: Dict[str, Any], step: Optional[int] = None):
@@ -245,7 +261,7 @@ class SwanlabTracker(Tracker):
             swanlab.log(log_dict, step=step)
 
     def close(self):
-        if self.rank == 0 and self.is_initialized and swanlab.is_running():
+        if self.rank == 0 and self.is_initialized and swanlab.get_run() is not None:
             swanlab.finish()
             self.is_initialized = False
 
