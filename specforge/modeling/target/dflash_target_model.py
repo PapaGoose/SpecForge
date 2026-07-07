@@ -130,9 +130,19 @@ class SGLangDFlashTargetModel(DFlashTargetModel):
 
     def set_capture_layers(self, layer_ids: List[int]) -> None:
         super().set_capture_layers(layer_ids)
-        if hasattr(self.model_runner.model, "set_eagle3_layers_to_capture"):
-            self.model_runner.model.set_eagle3_layers_to_capture(layer_ids)
-            print(self.model_runner.model.model.layers_to_capture)
+        model = self.model_runner.model
+        # Hybrid-attention text models (e.g. Qwen3.5/3.6) only capture aux hidden
+        # states from layers flagged via set_dflash_layers_to_capture;
+        # set_eagle3_layers_to_capture merely sets a layers_to_capture attribute
+        # those models never read, leaving aux hidden states empty and breaking
+        # the (hidden, aux) unpack in the wrapper's forward.
+        if hasattr(model, "set_dflash_layers_to_capture") and hasattr(
+            getattr(model, "model", None), "set_dflash_layers_to_capture"
+        ):
+            model.set_dflash_layers_to_capture(layer_ids)
+        elif hasattr(model, "set_eagle3_layers_to_capture"):
+            model.set_eagle3_layers_to_capture(layer_ids)
+            print(model.model.layers_to_capture)
 
     @torch.no_grad
     def _extend(self, reqs):
