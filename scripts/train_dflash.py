@@ -1,6 +1,21 @@
 #!/usr/bin/env python3
 # coding=utf-8
-"""DFlash Training Script."""
+"""DFlash Training Script.
+
+Two execution modes:
+
+* Colocated (default): every rank holds a TP shard of the target model plus a
+  full copy of the draft model; the target forward and the draft train step
+  run back-to-back on the same GPUs.
+
+* Disaggregated (``--disagg-inference-ranks N``, sglang backend only): the
+  first N ranks run the target model (TP=N) and stream hidden states over NCCL
+  p2p; the remaining ranks train the draft under FSDP, one data shard each,
+  and never load the target trunk. Example on 8 GPUs (4 inference + 4 train):
+
+      torchrun --nproc_per_node 8 scripts/train_dflash.py \
+          --target-model-backend sglang --disagg-inference-ranks 4 ...
+"""
 
 import argparse
 import functools
@@ -10,7 +25,7 @@ import os
 import shutil
 import time
 import warnings
-from typing import Optional, Tuple
+from typing import Callable, Optional, Tuple
 
 import torch
 import torch.distributed as dist
@@ -28,10 +43,11 @@ from specforge.args import SGLangBackendArgs, TrackerArgs
 from specforge.core.dflash import OnlineDFlashModel
 from specforge.data import build_eagle3_dataset, prepare_dp_dataloaders
 from specforge.distributed import destroy_distributed, get_dp_group, init_distributed
-from specforge.modeling.draft.dflash import DFlashDraftModel
+from specforge.modeling.draft.dflash import DFlashDraftModel, build_target_layer_ids
 from specforge.modeling.target.dflash_target_model import (
     DFlashTargetModel,
     get_dflash_target_model,
+    join_sglang_collective_init,
 )
 from specforge.modeling.target.target_utils import TargetEmbeddingsAndHead
 from specforge.optimizer import BF16Optimizer
@@ -43,6 +59,15 @@ from specforge.utils import (
     print_on_rank0,
     print_with_rank,
 )
+
+logger = logging.getLogger(__name__)
+
+
+def print_on_main(message, main_rank=0):
+    """print_on_rank0, but for runs where the logging rank is not global rank 0
+    (disaggregated mode logs from the first training rank)."""
+    if dist.get_rank() == main_rank:
+        logger.info(message)
 
 
 def parse_args():
@@ -179,6 +204,16 @@ def parse_args():
 
     dist_group = parser.add_argument_group("distributed")
     dist_group.add_argument("--dist-timeout", type=int, default=30)
+    dist_group.add_argument(
+        "--disagg-inference-ranks",
+        type=int,
+        default=0,
+        help="Disaggregated mode: the first N ranks run the sglang target model "
+        "(TP=N) and stream hidden states to the remaining ranks, which train "
+        "the draft model (FSDP, one data shard each) without loading the "
+        "target trunk. 0 disables (colocated mode). Requires "
+        "--target-model-backend sglang and world size divisible by N.",
+    )
 
     # SGLang specific args
     sglang_group = parser.add_argument_group("sglang backend")
@@ -187,28 +222,8 @@ def parse_args():
     return parser.parse_args()
 
 
-def build_models(args) -> Tuple[DFlashTargetModel, DFlashDraftModel]:
-    """Build target model (backend wrapper) and draft model."""
-    print_on_rank0(
-        f"Loading target model from {args.target_model_path} using {args.target_model_backend} backend"
-    )
-
-    target_model_kwargs = {}
-    if args.target_model_backend == "sglang":
-        target_model_kwargs = SGLangBackendArgs.from_args(args).to_kwargs()
-
-    device = get_local_device()
-    device_type = device.type
-
-    target_model = get_dflash_target_model(
-        pretrained_model_name_or_path=args.target_model_path,
-        backend=args.target_model_backend,
-        torch_dtype=torch.bfloat16,
-        device=device_type if args.target_model_backend == "hf" else None,
-        trust_remote_code=args.trust_remote_code,
-        **target_model_kwargs,
-    )
-
+def build_draft_config(args):
+    """Load or auto-generate the draft config and resolve loss-type defaults."""
     if args.draft_config_path:
         draft_config = AutoConfig.from_pretrained(args.draft_config_path)
         print_on_rank0(f"Loaded draft config from {args.draft_config_path}")
@@ -246,7 +261,49 @@ def build_models(args) -> Tuple[DFlashTargetModel, DFlashDraftModel]:
     draft_config._attn_implementation = args.attention_backend
     print_on_rank0(f"Using attention backend: {args.attention_backend}")
     print_on_rank0(f"Using DFlash training loss_type: {args.loss_type}")
+    return draft_config
 
+
+def resolve_target_layer_ids(draft_config):
+    """Mirror DFlashDraftModel's target_layer_ids resolution without
+    instantiating the (GPU-sized) draft model — used by inference-only ranks."""
+    dflash_config = getattr(draft_config, "dflash_config", None) or {}
+    return list(
+        dflash_config.get(
+            "target_layer_ids",
+            build_target_layer_ids(
+                draft_config.num_target_layers, draft_config.num_hidden_layers
+            ),
+        )
+    )
+
+
+def build_target_model(args) -> DFlashTargetModel:
+    target_model_kwargs = {}
+    if args.target_model_backend == "sglang":
+        target_model_kwargs = SGLangBackendArgs.from_args(args).to_kwargs()
+
+    device = get_local_device()
+    return get_dflash_target_model(
+        pretrained_model_name_or_path=args.target_model_path,
+        backend=args.target_model_backend,
+        torch_dtype=torch.bfloat16,
+        device=device.type if args.target_model_backend == "hf" else None,
+        trust_remote_code=args.trust_remote_code,
+        **target_model_kwargs,
+    )
+
+
+def build_models(args) -> Tuple[DFlashTargetModel, DFlashDraftModel]:
+    """Build target model (backend wrapper) and draft model."""
+    print_on_rank0(
+        f"Loading target model from {args.target_model_path} using {args.target_model_backend} backend"
+    )
+
+    target_model = build_target_model(args)
+    draft_config = build_draft_config(args)
+
+    device = get_local_device()
     draft_model = DFlashDraftModel(draft_config).to(device=device, dtype=torch.bfloat16)
 
     target_model.set_capture_layers(draft_model.target_layer_ids)
@@ -263,8 +320,8 @@ def build_models(args) -> Tuple[DFlashTargetModel, DFlashDraftModel]:
     return target_model, draft_model
 
 
-def build_dataloader(args, tokenizer) -> Tuple[DataLoader, Optional[DataLoader]]:
-    """Build train and eval dataloaders."""
+def build_train_dataset(args, tokenizer):
+    """Build the processed + filtered train dataset (deterministic across ranks)."""
     import hashlib
 
     cache_params_string = (
@@ -295,6 +352,12 @@ def build_dataloader(args, tokenizer) -> Tuple[DataLoader, Optional[DataLoader]]
     print_on_rank0(
         f"Filtered train dataset: {original_size} -> {len(train_eagle3_dataset)} samples"
     )
+    return train_eagle3_dataset
+
+
+def build_dataloader(args, tokenizer) -> Tuple[DataLoader, Optional[DataLoader]]:
+    """Build train and eval dataloaders (colocated mode)."""
+    train_eagle3_dataset = build_train_dataset(args, tokenizer)
 
     train_dataloader = prepare_dp_dataloaders(
         train_eagle3_dataset,
@@ -325,12 +388,52 @@ def build_dataloader(args, tokenizer) -> Tuple[DataLoader, Optional[DataLoader]]
     return train_dataloader, eval_dataloader
 
 
-def save_checkpoint(args, epoch, step, dflash_model, draft_model, optimizer):
-    """Save checkpoint."""
+def send_hidden_states(hidden_states: torch.Tensor, dst: int) -> None:
+    """P2P-send one shard's hidden states to its training rank.
+
+    A small shape header goes first so the receiver can detect dataloader
+    desync (recv into a wrong-sized buffer would corrupt silently)."""
+    header = torch.tensor(
+        list(hidden_states.shape), dtype=torch.long, device=hidden_states.device
+    )
+    dist.send(header, dst=dst)
+    dist.send(hidden_states.contiguous(), dst=dst)
+
+
+def recv_hidden_states(expected_shape, device, src: int) -> torch.Tensor:
+    header = torch.empty(len(expected_shape), dtype=torch.long, device=device)
+    dist.recv(header, src=src)
+    received = tuple(header.tolist())
+    if received != tuple(expected_shape):
+        raise RuntimeError(
+            f"Hidden-state shape {received} from inference rank {src} does not "
+            f"match the local batch {tuple(expected_shape)}; the inference and "
+            "training dataloaders are out of sync."
+        )
+    hidden_states = torch.empty(
+        *expected_shape, dtype=torch.bfloat16, device=device
+    )
+    dist.recv(hidden_states, src=src)
+    return hidden_states
+
+
+def save_checkpoint(
+    args,
+    epoch,
+    step,
+    dflash_model,
+    draft_model,
+    optimizer,
+    save_rank=0,
+    process_group=None,
+):
+    """Save checkpoint. In disaggregated mode only the training ranks enter
+    here, so barriers are scoped to their group and the writer is the first
+    training rank rather than global rank 0."""
     save_dir = os.path.join(args.output_dir, f"epoch_{epoch}_step_{step}")
-    if dist.get_rank() == 0:
+    if dist.get_rank() == save_rank:
         os.makedirs(save_dir, exist_ok=True)
-    dist.barrier()
+    dist.barrier(group=process_group)
 
     with FSDP.state_dict_type(dflash_model, StateDictType.FULL_STATE_DICT):
         state_dict = dflash_model.state_dict()
@@ -340,7 +443,7 @@ def save_checkpoint(args, epoch, step, dflash_model, draft_model, optimizer):
             if "draft_model." in k
         }
 
-        if dist.get_rank() == 0:
+        if dist.get_rank() == save_rank:
             torch.save(
                 {
                     "epoch": epoch,
@@ -365,9 +468,9 @@ def save_checkpoint(args, epoch, step, dflash_model, draft_model, optimizer):
             if os.path.exists(modeling_src):
                 shutil.copy(modeling_src, modeling_dst)
 
-            print_on_rank0(f"Saved checkpoint to {save_dir}")
+            logger.info(f"Saved checkpoint to {save_dir}")
 
-    dist.barrier()
+    dist.barrier(group=process_group)
 
 
 def record_metrics(
@@ -379,6 +482,7 @@ def record_metrics(
     optimizer,
     train_dataloader=None,
     mode: str = "train",
+    main_rank: int = 0,
 ) -> None:
     logdict = {}
 
@@ -388,48 +492,35 @@ def record_metrics(
     logdict[f"{mode}/loss"] = loss
     logdict[f"{mode}/accuracy"] = accuracy
 
-    print_on_rank0(
-        f"{mode.capitalize()} - Step {global_step} [{global_step}/{args.num_epochs * len(train_dataloader) // args.accumulation_steps}?], Loss: {loss:.4f}, Acc: {accuracy:.4f}"
+    print_on_main(
+        f"{mode.capitalize()} - Step {global_step} [{global_step}/{args.num_epochs * len(train_dataloader) // args.accumulation_steps}?], Loss: {loss:.4f}, Acc: {accuracy:.4f}",
+        main_rank=main_rank,
     )
 
     tracker.log(logdict, step=global_step)
 
 
-def main():
+def run_training(
+    args,
+    draft_model: DFlashDraftModel,
+    tokenizer,
+    train_dataloader: DataLoader,
+    hidden_provider: Callable[[torch.Tensor, torch.Tensor, torch.Tensor], torch.Tensor],
+    draft_model_last_checkpoint: Optional[str] = None,
+    ckpt_info: Tuple[int, int] = (0, 0),
+    dp_group: Optional[dist.ProcessGroup] = None,
+    main_rank: int = 0,
+):
+    """Wrap the draft in FSDP and run the train loop.
 
-    logging.basicConfig(
-        format="%(asctime)s - %(levelname)s - %(name)s - %(message)s",
-        datefmt="%m/%d/%Y %H:%M:%S",
-        level=logging.INFO,
-    )
-    logging.getLogger().setLevel(logging.INFO)
-    warnings.filterwarnings(
-        "ignore",
-        "The .grad attribute of a Tensor that is not a leaf Tensor is being accessed",
-    )
-
-    args = parse_args()
-    set_seed(args.seed)
-
-    init_distributed(timeout=args.dist_timeout, tp_size=args.tp_size)
-    print_with_rank("Initialized distributed")
-
-    draft_model_last_checkpoint = None
-    ckpt_info = (0, 0)
-    if args.resume and os.path.isdir(args.output_dir):
-        draft_model_last_checkpoint, ckpt_info = get_last_checkpoint(args.output_dir)
-        print(f"Last checkpoint detected: {draft_model_last_checkpoint}")
-
-    # If resuming, load config from checkpoint to ensure consistency
-    if draft_model_last_checkpoint:
-        checkpoint_config_path = os.path.join(
-            draft_model_last_checkpoint, "config.json"
-        )
-        if os.path.exists(checkpoint_config_path):
-            print(f"Loading draft config from checkpoint: {checkpoint_config_path}")
-            args.draft_config_path = checkpoint_config_path
-
-    target_model, draft_model = build_models(args)
+    ``hidden_provider(input_ids, attention_mask, loss_mask)`` returns the
+    target hidden states for the local batch: in colocated mode it runs the
+    target forward on this rank, in disaggregated mode it receives them from
+    the paired inference rank. ``dp_group`` scopes FSDP and metric reduction
+    (None = the whole world, i.e. colocated mode).
+    """
+    device = get_local_device()
+    rank = dist.get_rank()
 
     resume_state = None
     if draft_model_last_checkpoint:
@@ -438,7 +529,7 @@ def main():
         )
         draft_model.load_state_dict(loaded_model.state_dict())
         del loaded_model
-        print("Loaded draft model weights from checkpoint")
+        print_on_main("Loaded draft model weights from checkpoint", main_rank)
 
         training_state_path = os.path.join(
             draft_model_last_checkpoint, "training_state.pt"
@@ -447,12 +538,11 @@ def main():
             resume_state = torch.load(
                 training_state_path, map_location="cpu", weights_only=False
             )
-            print(
+            print_on_main(
                 f"Will resume from epoch {resume_state['epoch']}, "
-                f"step {resume_state['global_step']}"
+                f"step {resume_state['global_step']}",
+                main_rank,
             )
-
-    tokenizer = load_tokenizer(args.target_model_path)
 
     if args.mask_token_id is not None:
         mask_token_id = args.mask_token_id
@@ -465,27 +555,23 @@ def main():
     else:
         tokenizer.add_special_tokens({"mask_token": "<|MASK|>"})
         mask_token_id = tokenizer.mask_token_id
-    print_on_rank0(f"Using mask_token_id: {mask_token_id}")
+    print_on_main(f"Using mask_token_id: {mask_token_id}", main_rank)
 
     draft_model.mask_token_id = mask_token_id
     draft_model.config.dflash_config["mask_token_id"] = mask_token_id
     draft_model.config.dflash_config["target_layer_ids"] = draft_model.target_layer_ids
-    print_on_rank0(f"dflash_config: {draft_model.config.dflash_config}")
-
-    train_dataloader, eval_dataloader = build_dataloader(args, tokenizer)
+    print_on_main(f"dflash_config: {draft_model.config.dflash_config}", main_rank)
 
     steps_per_epoch = math.ceil(len(train_dataloader) / args.accumulation_steps)
     total_steps = args.num_epochs * steps_per_epoch
-    print_on_rank0(f"Total training steps: {total_steps}")
+    print_on_main(f"Total training steps: {total_steps}", main_rank)
 
-    print_on_rank0("Loading target embeddings and head...")
-    device = get_local_device()
-    device_type = device.type
+    print_on_main("Loading target embeddings and head...", main_rank)
     target_components = TargetEmbeddingsAndHead.from_pretrained(
         args.target_model_path,
         embed_key=args.embedding_key,
         lm_head_key=args.lm_head_key,
-        device=device_type,
+        device=device.type,
         trust_remote_code=args.trust_remote_code,
     )
 
@@ -520,6 +606,8 @@ def main():
         ),
         sharding_strategy=ShardingStrategy.SHARD_GRAD_OP,
     )
+    if dp_group is not None:
+        fsdp_kwargs["process_group"] = dp_group
     block_names = set(getattr(draft_model, "_no_split_modules", None) or [])
     block_classes = {
         type(m) for m in dflash_model.modules() if type(m).__name__ in block_names
@@ -553,26 +641,37 @@ def main():
         start_epoch = resume_state["epoch"]
         global_step = resume_state["global_step"]
         del resume_state
-        print_on_rank0(
+        print_on_main(
             f"Restored optimizer/scheduler state: "
             f"epoch={start_epoch}, step={global_step}, "
-            f"lr={optimizer.get_learning_rate():.6f}"
+            f"lr={optimizer.get_learning_rate():.6f}",
+            main_rank,
         )
 
     skip_steps = global_step - start_epoch * len(train_dataloader)
 
-    print_on_rank0(f"Initializing tracker (report_to={args.report_to})...")
+    print_on_main(f"Initializing tracker (report_to={args.report_to})...", main_rank)
+    # Trackers gate on global rank 0 by default; in disaggregated mode that is
+    # an inference rank which never logs, so nominate this group's main rank.
+    args.tracker_main_rank = main_rank
     tracker = create_tracker(args, args.output_dir)
-    print_on_rank0("Tracker initialized successfully.")
+    print_on_main("Tracker initialized successfully.", main_rank)
+
+    # Aligns with the inference ranks' pre-loop barrier in disaggregated mode
+    # (and warms up the world communicator before the first p2p op); harmless
+    # in colocated mode.
+    dist.barrier()
 
     last_time = time.time()
-    print_on_rank0(f"Starting training from epoch {start_epoch}, step {global_step}")
+    print_on_main(
+        f"Starting training from epoch {start_epoch}, step {global_step}", main_rank
+    )
 
     for epoch in range(start_epoch, args.num_epochs):
         train_dataloader.sampler.set_epoch(epoch)
         draft_model.train()
 
-        if dist.get_rank() == 0:
+        if rank == main_rank:
             progress_bar = tqdm(
                 train_dataloader, desc=f"Training Epoch {epoch}", leave=True
             )
@@ -587,10 +686,7 @@ def main():
             input_ids = data["input_ids"].to(device, non_blocking=True)
             attention_mask = data["attention_mask"].to(device, non_blocking=True)
             loss_mask = data["loss_mask"].to(device, non_blocking=True)
-            target_output = target_model.generate_dflash_data(
-                input_ids, attention_mask, loss_mask
-            )
-            hidden_states = target_output.hidden_states.to(device, non_blocking=True)
+            hidden_states = hidden_provider(input_ids, attention_mask, loss_mask)
 
             loss, accuracy = dflash_model(
                 input_ids=input_ids,
@@ -606,10 +702,10 @@ def main():
             if global_step % args.log_interval == 0:
                 loss_log = loss.clone()
                 acc_log = accuracy.clone()
-                dist.all_reduce(loss_log)
-                dist.all_reduce(acc_log)
-                loss_log = loss_log / dist.get_world_size()
-                acc_log = acc_log / dist.get_world_size()
+                dist.all_reduce(loss_log, group=dp_group)
+                dist.all_reduce(acc_log, group=dp_group)
+                loss_log = loss_log / dist.get_world_size(dp_group)
+                acc_log = acc_log / dist.get_world_size(dp_group)
 
                 record_metrics(
                     args,
@@ -620,9 +716,10 @@ def main():
                     optimizer,
                     train_dataloader,
                     mode="train",
+                    main_rank=main_rank,
                 )
 
-            if dist.get_rank() == 0:
+            if rank == main_rank:
                 elapsed = time.time() - last_time
                 last_time = time.time()
                 progress_bar.set_postfix(
@@ -635,14 +732,288 @@ def main():
 
             if global_step % args.save_interval == 0:
                 save_checkpoint(
-                    args, epoch, global_step, dflash_model, draft_model, optimizer
+                    args,
+                    epoch,
+                    global_step,
+                    dflash_model,
+                    draft_model,
+                    optimizer,
+                    save_rank=main_rank,
+                    process_group=dp_group,
                 )
 
     save_checkpoint(
-        args, args.num_epochs, global_step, dflash_model, draft_model, optimizer
+        args,
+        args.num_epochs,
+        global_step,
+        dflash_model,
+        draft_model,
+        optimizer,
+        save_rank=main_rank,
+        process_group=dp_group,
     )
 
     tracker.close()
+    # Let the other side (inference ranks in disaggregated mode) tear down in
+    # step with us; harmless in colocated mode.
+    dist.barrier()
+
+
+def run_disagg_inference(args, ckpt_info: Tuple[int, int], num_shards: int):
+    """Producer side of a disaggregated run (ranks [0, N)).
+
+    Builds the sglang target (TP over the inference ranks), iterates every
+    training shard's dataloader in lockstep, and streams each shard's hidden
+    states to its training rank. Iteration order and skip logic must mirror
+    run_training exactly — both sides derive them from the same dataset,
+    samplers, and ckpt_info.
+    """
+    device = get_local_device()
+    rank = dist.get_rank()
+    num_inference_ranks = args.disagg_inference_ranks
+
+    draft_config = build_draft_config(args)
+    target_layer_ids = resolve_target_layer_ids(draft_config)
+
+    print_on_rank0(
+        f"Loading target model from {args.target_model_path} using sglang backend "
+        f"(disaggregated inference, TP={num_inference_ranks})"
+    )
+    target_model = build_target_model(args)
+    target_model.set_capture_layers(target_layer_ids)
+
+    tokenizer = load_tokenizer(args.target_model_path)
+    train_dataset = build_train_dataset(args, tokenizer)
+    shard_loaders = [
+        prepare_dp_dataloaders(
+            train_dataset,
+            args.batch_size,
+            num_workers=max(1, args.dataloader_num_workers // num_shards),
+            shuffle=True,
+            dp_rank=shard_idx,
+            dp_size=num_shards,
+        )
+        for shard_idx in range(num_shards)
+    ]
+
+    # DistributedSampler pads shards to equal length, so every loader has the
+    # same number of batches — the same value run_training sees.
+    num_batches = len(shard_loaders[0])
+    start_epoch, global_step = ckpt_info
+    skip_steps = global_step - start_epoch * num_batches
+
+    # Matches the pre-loop barrier in run_training.
+    dist.barrier()
+    print_with_rank("Starting disaggregated inference loop")
+
+    for epoch in range(start_epoch, args.num_epochs):
+        for loader in shard_loaders:
+            loader.sampler.set_epoch(epoch)
+        iterators = [iter(loader) for loader in shard_loaders]
+
+        for step_in_epoch in range(num_batches):
+            # Consume every shard's batch even on skipped (resume) steps to
+            # keep the data order aligned with the training side.
+            batches = [next(it) for it in iterators]
+            if epoch == start_epoch and step_in_epoch < skip_steps:
+                continue
+
+            for shard_idx, data in enumerate(batches):
+                input_ids = data["input_ids"].to(device, non_blocking=True)
+                attention_mask = data["attention_mask"].to(device, non_blocking=True)
+                loss_mask = data["loss_mask"].to(device, non_blocking=True)
+                target_output = target_model.generate_dflash_data(
+                    input_ids, attention_mask, loss_mask
+                )
+                # Hidden states are replicated across the TP group, so spread
+                # the send work round-robin over the inference ranks.
+                if rank == shard_idx % num_inference_ranks:
+                    send_hidden_states(
+                        target_output.hidden_states.to(torch.bfloat16),
+                        dst=num_inference_ranks + shard_idx,
+                    )
+
+    # Matches run_training's post-save barrier so teardown is in step.
+    dist.barrier()
+
+
+def run_disagg_training(
+    args,
+    draft_model_last_checkpoint: Optional[str],
+    ckpt_info: Tuple[int, int],
+    train_group: dist.ProcessGroup,
+    num_shards: int,
+):
+    """Consumer side of a disaggregated run (ranks [N, world))."""
+    device = get_local_device()
+    rank = dist.get_rank()
+    num_inference_ranks = args.disagg_inference_ranks
+    shard_idx = rank - num_inference_ranks
+    src_rank = shard_idx % num_inference_ranks
+
+    draft_config = build_draft_config(args)
+
+    # The inference ranks are constructing SGLangRunner right now, which
+    # creates process groups via world-collective new_group() calls; join the
+    # same sequence here or both sides deadlock.
+    target_model_kwargs = SGLangBackendArgs.from_args(args).to_kwargs()
+    join_sglang_collective_init(
+        args.target_model_path,
+        torch_dtype=torch.bfloat16,
+        trust_remote_code=args.trust_remote_code,
+        **target_model_kwargs,
+    )
+    print_with_rank("Joined sglang collective init (training rank)")
+
+    draft_model = DFlashDraftModel(draft_config).to(device=device, dtype=torch.bfloat16)
+    hidden_dim = len(draft_model.target_layer_ids) * draft_model.config.hidden_size
+    print_on_main(
+        f"Draft config: block_size={draft_config.block_size}, "
+        f"num_hidden_layers={draft_config.num_hidden_layers}, "
+        f"num_target_layers={draft_config.num_target_layers}",
+        num_inference_ranks,
+    )
+    print_on_main(
+        f"Draft model parameters: {sum(p.numel() for p in draft_model.parameters()):,}",
+        num_inference_ranks,
+    )
+
+    tokenizer = load_tokenizer(args.target_model_path)
+    train_dataset = build_train_dataset(args, tokenizer)
+    train_dataloader = prepare_dp_dataloaders(
+        train_dataset,
+        args.batch_size,
+        num_workers=args.dataloader_num_workers,
+        shuffle=True,
+        dp_rank=shard_idx,
+        dp_size=num_shards,
+    )
+    if args.eval_data_path:
+        print_on_main(
+            "Warning: --eval-data-path is ignored in disaggregated mode",
+            num_inference_ranks,
+        )
+
+    def hidden_provider(input_ids, attention_mask, loss_mask):
+        expected = (input_ids.shape[0], input_ids.shape[1], hidden_dim)
+        return recv_hidden_states(expected, device, src=src_rank)
+
+    run_training(
+        args,
+        draft_model,
+        tokenizer,
+        train_dataloader,
+        hidden_provider,
+        draft_model_last_checkpoint=draft_model_last_checkpoint,
+        ckpt_info=ckpt_info,
+        dp_group=train_group,
+        main_rank=num_inference_ranks,
+    )
+
+
+def main():
+
+    logging.basicConfig(
+        format="%(asctime)s - %(levelname)s - %(name)s - %(message)s",
+        datefmt="%m/%d/%Y %H:%M:%S",
+        level=logging.INFO,
+    )
+    logging.getLogger().setLevel(logging.INFO)
+    warnings.filterwarnings(
+        "ignore",
+        "The .grad attribute of a Tensor that is not a leaf Tensor is being accessed",
+    )
+
+    args = parse_args()
+    set_seed(args.seed)
+
+    num_inference_ranks = args.disagg_inference_ranks
+    if num_inference_ranks > 0:
+        if args.target_model_backend != "sglang":
+            raise ValueError(
+                "--disagg-inference-ranks requires --target-model-backend sglang"
+            )
+        if args.tp_size not in (1, num_inference_ranks):
+            print(
+                f"Warning: --tp-size {args.tp_size} is ignored in disaggregated "
+                f"mode; the target runs TP={num_inference_ranks}"
+            )
+        args.tp_size = num_inference_ranks
+
+    init_distributed(timeout=args.dist_timeout, tp_size=args.tp_size)
+    print_with_rank("Initialized distributed")
+
+    train_group = None
+    num_shards = None
+    if num_inference_ranks > 0:
+        world_size = dist.get_world_size()
+        if world_size <= num_inference_ranks:
+            raise ValueError(
+                f"--disagg-inference-ranks {num_inference_ranks} leaves no "
+                f"training ranks (world size {world_size})"
+            )
+        if world_size % num_inference_ranks != 0:
+            # The sglang patch builds its group lists as consecutive blocks of
+            # tp_size covering the whole world; a non-divisible world breaks
+            # the collective group creation the training ranks must mirror.
+            raise ValueError(
+                f"world size ({world_size}) must be divisible by "
+                f"--disagg-inference-ranks ({num_inference_ranks})"
+            )
+        num_shards = world_size - num_inference_ranks
+        # Collective: every rank must participate in group creation.
+        train_group = dist.new_group(list(range(num_inference_ranks, world_size)))
+
+    draft_model_last_checkpoint = None
+    ckpt_info = (0, 0)
+    if args.resume and os.path.isdir(args.output_dir):
+        draft_model_last_checkpoint, ckpt_info = get_last_checkpoint(args.output_dir)
+        print(f"Last checkpoint detected: {draft_model_last_checkpoint}")
+
+    # If resuming, load config from checkpoint to ensure consistency
+    if draft_model_last_checkpoint:
+        checkpoint_config_path = os.path.join(
+            draft_model_last_checkpoint, "config.json"
+        )
+        if os.path.exists(checkpoint_config_path):
+            print(f"Loading draft config from checkpoint: {checkpoint_config_path}")
+            args.draft_config_path = checkpoint_config_path
+
+    if num_inference_ranks > 0:
+        if dist.get_rank() < num_inference_ranks:
+            run_disagg_inference(args, ckpt_info, num_shards)
+        else:
+            run_disagg_training(
+                args,
+                draft_model_last_checkpoint,
+                ckpt_info,
+                train_group,
+                num_shards,
+            )
+        destroy_distributed()
+        return
+
+    target_model, draft_model = build_models(args)
+    tokenizer = load_tokenizer(args.target_model_path)
+    train_dataloader, eval_dataloader = build_dataloader(args, tokenizer)
+
+    device = get_local_device()
+
+    def hidden_provider(input_ids, attention_mask, loss_mask):
+        target_output = target_model.generate_dflash_data(
+            input_ids, attention_mask, loss_mask
+        )
+        return target_output.hidden_states.to(device, non_blocking=True)
+
+    run_training(
+        args,
+        draft_model,
+        tokenizer,
+        train_dataloader,
+        hidden_provider,
+        draft_model_last_checkpoint=draft_model_last_checkpoint,
+        ckpt_info=ckpt_info,
+    )
     destroy_distributed()
 
 

@@ -258,6 +258,8 @@ def prepare_dp_dataloaders(
     shuffle: Optional[bool] = False,
     is_vlm: Optional[bool] = False,
     prefetch_factor: Optional[int] = 2,
+    dp_rank: Optional[int] = None,
+    dp_size: Optional[int] = None,
     **dataloader_kwargs,
 ) -> DataLoader:
     """
@@ -271,15 +273,21 @@ def prepare_dp_dataloaders(
         pin_memory: Whether to pin memory for data loading.
         shuffle: Whether to shuffle the dataset.
         is_vlm: Whether the dataset is a vision-language model dataset.
+        dp_rank: Explicit shard index override. Use together with ``dp_size``
+            when the shard cannot be derived from the caller's process group
+            (e.g. disaggregated inference ranks materializing every training
+            shard's loader).
+        dp_size: Explicit number of shards override.
         **dataloader_kwargs: Additional keyword arguments for the DataLoader.
 
     Returns:
         A DataLoader for the dataset.
     """
-    world_size = dist.get_world_size(process_group)
-    rank = dist.get_rank(process_group)
+    if dp_size is None:
+        dp_size = dist.get_world_size(process_group)
+        dp_rank = dist.get_rank(process_group)
     sampler = DistributedSampler(
-        dataset, num_replicas=world_size, rank=rank, shuffle=shuffle
+        dataset, num_replicas=dp_size, rank=dp_rank, shuffle=shuffle
     )
     if is_vlm:
         datacollator_cls = VlmDataCollatorWithPadding

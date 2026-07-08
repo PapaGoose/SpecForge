@@ -274,6 +274,75 @@ class SGLangDFlashTargetModel(DFlashTargetModel):
         )
 
 
+def join_sglang_collective_init(
+    pretrained_model_name_or_path: str,
+    torch_dtype: torch.dtype = None,
+    trust_remote_code: bool = False,
+    **kwargs,
+) -> None:
+    """Participate in sglang's world-collective process-group creation without
+    building a model runner.
+
+    The patched ``init_distributed_environment`` / ``initialize_model_parallel``
+    (see ``sglang_backend/patch.py``) create their groups with
+    ``torch.distributed.new_group``, which every rank in the world must enter —
+    including ranks that are not members of the resulting groups. In a
+    disaggregated run only the inference ranks construct ``SGLangRunner``, so
+    the training ranks call this mirror with the same arguments that
+    ``SGLangDFlashTargetModel.from_pretrained`` passes; it walks the same
+    group-creation sequence (keeping the collectives aligned across the world)
+    and returns without loading weights or allocating a KV pool.
+    """
+    from sglang.srt.distributed import (
+        set_custom_all_reduce,
+        set_mscclpp_all_reduce,
+        set_torch_symm_mem_all_reduce,
+    )
+
+    from .sglang_backend.patch import (
+        init_distributed_environment,
+        initialize_model_parallel,
+    )
+
+    tp_size = dist.get_world_size(get_tp_group())
+    dtype_arg = torch_dtype if torch_dtype is not None else "auto"
+    # Mirror of the ServerArgs built in SGLangDFlashTargetModel.from_pretrained:
+    # only its parallel-topology fields (tp/pp/ep/dp/attn_cp/moe_dp/pdmux) feed
+    # the group creation, but constructing it identically keeps them in lockstep
+    # if from_pretrained ever changes.
+    server_args = ServerArgs(
+        model_path=pretrained_model_name_or_path,
+        trust_remote_code=trust_remote_code,
+        dtype=dtype_arg,
+        enable_return_hidden_states=True,
+        disable_cuda_graph=True,
+        chunked_prefill_size=-1,
+        tp_size=tp_size,
+        pp_size=1,
+        **kwargs,
+    )
+
+    set_custom_all_reduce(not server_args.disable_custom_all_reduce)
+    set_mscclpp_all_reduce(server_args.enable_mscclpp)
+    set_torch_symm_mem_all_reduce(server_args.enable_torch_symm_mem)
+
+    init_distributed_environment(
+        backend="nccl",
+        world_size=server_args.tp_size * server_args.pp_size,
+        rank=dist.get_rank(get_tp_group()),
+        local_rank=torch.cuda.current_device(),
+    )
+    initialize_model_parallel(
+        tensor_model_parallel_size=server_args.tp_size,
+        pipeline_model_parallel_size=server_args.pp_size,
+        expert_model_parallel_size=server_args.ep_size,
+        attention_data_parallel_size=getattr(server_args, "dp_size", 1),
+        attention_context_model_parallel_size=getattr(server_args, "attn_cp_size", 1),
+        moe_data_model_parallel_size=getattr(server_args, "moe_dp_size", 1),
+        duplicate_tp_group=server_args.enable_pdmux,
+    )
+
+
 class HFDFlashTargetModel(DFlashTargetModel):
     def __init__(self, model: nn.Module):
         super().__init__()

@@ -49,7 +49,11 @@ class Tracker(abc.ABC):
     def __init__(self, args, output_dir: str):
         self.args = args
         self.output_dir = output_dir
-        self.rank = dist.get_rank()
+        # Rank gating below compares against 0, so store the rank relative to
+        # args.tracker_main_rank (default 0). Runs where global rank 0 never
+        # produces metrics (e.g. disaggregated inference/training splits) set
+        # tracker_main_rank to the first training rank to log from there.
+        self.rank = dist.get_rank() - getattr(args, "tracker_main_rank", 0)
         self.is_initialized = False
 
     @classmethod
