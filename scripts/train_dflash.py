@@ -939,6 +939,17 @@ def main():
                 f"mode; the target runs TP={num_inference_ranks}"
             )
         args.tp_size = num_inference_ranks
+        if args.sglang_mem_fraction_static < 0.6:
+            # The 0.4 default in SGLangBackendArgs is a colocated setting that
+            # leaves room for the draft/FSDP on the same GPU. Inference ranks
+            # are dedicated to sglang; a low fraction leaves almost nothing
+            # for the KV/mamba pools after the target weights (on hybrid
+            # models this surfaces as "alloc_req_slots runs out of memory").
+            print(
+                f"Warning: --sglang-mem-fraction-static "
+                f"{args.sglang_mem_fraction_static} is low for disaggregated "
+                f"mode, where inference GPUs run only sglang; consider 0.75+"
+            )
 
     init_distributed(timeout=args.dist_timeout, tp_size=args.tp_size)
     print_with_rank("Initialized distributed")
