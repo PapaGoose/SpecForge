@@ -30,6 +30,11 @@ from typing import Callable, Optional, Tuple
 import torch
 import torch.distributed as dist
 from accelerate.utils import set_seed
+from torch.distributed.algorithms._checkpoint.checkpoint_wrapper import (
+    CheckpointImpl,
+    apply_activation_checkpointing,
+    checkpoint_wrapper,
+)
 from torch.distributed.fsdp import BackwardPrefetch
 from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
 from torch.distributed.fsdp import MixedPrecision, ShardingStrategy, StateDictType
@@ -181,6 +186,12 @@ def parse_args():
     training_group.add_argument("--warmup-ratio", type=float, default=0.04)
     training_group.add_argument("--max-grad-norm", type=float, default=1.0)
     training_group.add_argument("--accumulation-steps", type=int, default=1)
+    training_group.add_argument(
+        "--gradient-checkpointing",
+        action="store_true",
+        help="Recompute draft transformer blocks in backward instead of "
+        "storing their activations; large memory saving for ~30%% slower steps",
+    )
     training_group.add_argument("--seed", type=int, default=42)
     training_group.add_argument("--resume", action="store_true")
 
@@ -624,6 +635,22 @@ def run_training(
         )
     dflash_model = FSDP(dflash_model, **fsdp_kwargs)
     print_with_rank("Initialized FSDP")
+
+    if args.gradient_checkpointing:
+        if block_classes:
+            apply_activation_checkpointing(
+                dflash_model,
+                checkpoint_wrapper_fn=functools.partial(
+                    checkpoint_wrapper, checkpoint_impl=CheckpointImpl.NO_REENTRANT
+                ),
+                check_fn=lambda m: isinstance(m, tuple(block_classes)),
+            )
+            print_with_rank("Enabled activation checkpointing on draft blocks")
+        else:
+            print_with_rank(
+                "Warning: --gradient-checkpointing requested but no draft block "
+                "classes were resolved; skipping"
+            )
 
     start_epoch = ckpt_info[0]
     global_step = ckpt_info[1]
