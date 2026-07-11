@@ -446,6 +446,19 @@ def save_checkpoint(
         os.makedirs(save_dir, exist_ok=True)
     dist.barrier(group=process_group)
 
+    # Optimizer/Adam state is a rank-local FSDP shard (see BF16Optimizer), so
+    # every rank persists its own file; a single rank's shard is useless on
+    # the others and resuming from it crashes in Adam with mismatched sizes.
+    group_rank = dist.get_rank(group=process_group)
+    torch.save(
+        {
+            "epoch": epoch,
+            "global_step": step,
+            **optimizer.state_dict(),
+        },
+        os.path.join(save_dir, f"training_state_rank{group_rank}.pt"),
+    )
+
     with FSDP.state_dict_type(dflash_model, StateDictType.FULL_STATE_DICT):
         state_dict = dflash_model.state_dict()
         draft_state_dict = {
@@ -460,7 +473,6 @@ def save_checkpoint(
                     "epoch": epoch,
                     "global_step": step,
                     "args": args,
-                    **optimizer.state_dict(),
                 },
                 os.path.join(save_dir, "training_state.pt"),
             )
@@ -542,13 +554,35 @@ def run_training(
         del loaded_model
         print_on_main("Loaded draft model weights from checkpoint", main_rank)
 
-        training_state_path = os.path.join(
+        # Optimizer state under FSDP is a rank-local shard (BF16Optimizer
+        # clones this rank's param views), so each rank saves and restores its
+        # own file. The legacy single training_state.pt holds only the writer
+        # rank's shard — loading it on other ranks produces wrong-size Adam
+        # moments, so for legacy checkpoints every rank resets the moments and
+        # restores only scheduler/epoch/step.
+        group_rank = dist.get_rank(group=dp_group)
+        rank_state_path = os.path.join(
+            draft_model_last_checkpoint, f"training_state_rank{group_rank}.pt"
+        )
+        legacy_state_path = os.path.join(
             draft_model_last_checkpoint, "training_state.pt"
         )
-        if os.path.exists(training_state_path):
+        resume_optimizer_state = False
+        if os.path.exists(rank_state_path):
             resume_state = torch.load(
-                training_state_path, map_location="cpu", weights_only=False
+                rank_state_path, map_location="cpu", weights_only=False
             )
+            resume_optimizer_state = True
+        elif os.path.exists(legacy_state_path):
+            resume_state = torch.load(
+                legacy_state_path, map_location="cpu", weights_only=False
+            )
+            print_on_main(
+                "Legacy checkpoint without per-rank optimizer shards: Adam "
+                "moments will be reset; scheduler/epoch/step are restored",
+                main_rank,
+            )
+        if resume_state is not None:
             print_on_main(
                 f"Will resume from epoch {resume_state['epoch']}, "
                 f"step {resume_state['global_step']}",
@@ -664,7 +698,10 @@ def run_training(
     )
 
     if resume_state is not None:
-        optimizer.load_state_dict(resume_state)
+        if resume_optimizer_state:
+            optimizer.load_state_dict(resume_state)
+        elif (scheduler_state := resume_state.get("scheduler_state_dict")) is not None:
+            optimizer.scheduler.load_state_dict(scheduler_state)
         start_epoch = resume_state["epoch"]
         global_step = resume_state["global_step"]
         del resume_state

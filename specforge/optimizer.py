@@ -54,8 +54,25 @@ class BF16Optimizer:
         return self.last_grad_norm
 
     def load_state_dict(self, state_dict):
-        self.optimizer.load_state_dict(state_dict["optimizer_state_dict"])
-        print_on_rank0("Successfully loaded optimizer state_dict.")
+        opt_state = state_dict["optimizer_state_dict"]
+        # Adam does not validate shapes on load and only crashes at step();
+        # a mismatch means the state was saved under different parameter
+        # sharding (e.g. another rank's FSDP shard or a different world size).
+        mismatched = any(
+            torch.is_tensor(entry.get("exp_avg"))
+            and idx < len(self.fp32_params)
+            and entry["exp_avg"].numel() != self.fp32_params[idx].numel()
+            for idx, entry in opt_state.get("state", {}).items()
+        )
+        if mismatched:
+            print(
+                "Warning: checkpointed optimizer state does not match this "
+                "rank's parameter shards (saved with a different world size "
+                "or sharding); resetting Adam moments on this rank."
+            )
+        else:
+            self.optimizer.load_state_dict(opt_state)
+            print_on_rank0("Successfully loaded optimizer state_dict.")
         self.scheduler.load_state_dict(state_dict["scheduler_state_dict"])
         print_on_rank0("Successfully loaded scheduler state_dict.")
 
