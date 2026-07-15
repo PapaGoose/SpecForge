@@ -29,6 +29,7 @@ from typing import Callable, Optional, Tuple
 
 import torch
 import torch.distributed as dist
+from accelerate import skip_first_batches
 from accelerate.utils import set_seed
 from torch.distributed.algorithms._checkpoint.checkpoint_wrapper import (
     CheckpointImpl,
@@ -735,16 +736,23 @@ def run_training(
         train_dataloader.sampler.set_epoch(epoch)
         draft_model.train()
 
+        # Resume: skip at the batch-sampler level so the skipped batches are
+        # never loaded. Consuming them through the loader takes tens of
+        # minutes at scale, and on the inference side costs num_shards times
+        # more — enough skew for the first p2p op to outlive the c10d
+        # communicator-bootstrap timeout (30 min).
+        epoch_loader = train_dataloader
+        if epoch == start_epoch and skip_steps > 0:
+            epoch_loader = skip_first_batches(train_dataloader, skip_steps)
+
         if rank == main_rank:
             progress_bar = tqdm(
-                train_dataloader, desc=f"Training Epoch {epoch}", leave=True
+                epoch_loader, desc=f"Training Epoch {epoch}", leave=True
             )
         else:
-            progress_bar = train_dataloader
+            progress_bar = epoch_loader
 
-        for step_in_epoch, data in enumerate(progress_bar):
-            if epoch == start_epoch and step_in_epoch < skip_steps:
-                continue
+        for data in progress_bar:
             global_step += 1
 
             input_ids = data["input_ids"].to(device, non_blocking=True)
@@ -873,15 +881,21 @@ def run_disagg_inference(args, ckpt_info: Tuple[int, int], num_shards: int):
     for epoch in range(start_epoch, args.num_epochs):
         for loader in shard_loaders:
             loader.sampler.set_epoch(epoch)
-        iterators = [iter(loader) for loader in shard_loaders]
 
-        for step_in_epoch in range(num_batches):
-            # Consume every shard's batch even on skipped (resume) steps to
-            # keep the data order aligned with the training side.
+        # Resume: mirror run_training's sampler-level skip. Materializing the
+        # skipped batches here costs num_shards times the training side's
+        # fast-forward, and the resulting skew stalls the first p2p exchange
+        # past the c10d communicator-bootstrap timeout.
+        epoch_skip = skip_steps if epoch == start_epoch else 0
+        epoch_loaders = shard_loaders
+        if epoch_skip > 0:
+            epoch_loaders = [
+                skip_first_batches(loader, epoch_skip) for loader in shard_loaders
+            ]
+        iterators = [iter(loader) for loader in epoch_loaders]
+
+        for _ in range(num_batches - epoch_skip):
             batches = [next(it) for it in iterators]
-            if epoch == start_epoch and step_in_epoch < skip_steps:
-                continue
-
             for shard_idx, data in enumerate(batches):
                 input_ids = data["input_ids"].to(device, non_blocking=True)
                 attention_mask = data["attention_mask"].to(device, non_blocking=True)
