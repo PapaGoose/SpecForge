@@ -167,7 +167,9 @@ class DataConfig(StrictConfigModel):
 class TrackingConfig(StrictConfigModel):
     """Optional experiment tracking behind the trainer's logger seam."""
 
-    report_to: Literal["none", "wandb", "tensorboard", "swanlab", "mlflow"] = "none"
+    report_to: Literal[
+        "none", "wandb", "tensorboard", "swanlab", "mlflow", "clearml"
+    ] = "none"
     wandb_project: Optional[str] = None
     wandb_name: Optional[str] = None
     wandb_key: Optional[str] = None
@@ -179,6 +181,10 @@ class TrackingConfig(StrictConfigModel):
     mlflow_tracking_uri: Optional[str] = None
     mlflow_experiment_name: Optional[str] = None
     mlflow_run_name: Optional[str] = None
+    clearml_project_name: Optional[str] = None
+    clearml_jira_task: Optional[str] = None
+    #: Where ClearML uploads run artifacts. Defaults to the team's S3 endpoint.
+    clearml_output_uri: str = "s3://storage.mwsapis.ru:443/clearml-fndrs/experiments"
 
 
 class ProfilingConfig(StrictConfigModel):

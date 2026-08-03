@@ -374,7 +374,7 @@ unless tuning throughput or memory pressure.
 
 | Field | Default | What to write |
 | --- | --- | --- |
-| `tracking.report_to` | `none` | `none`, `wandb`, `tensorboard`, `swanlab`, or `mlflow`. |
+| `tracking.report_to` | `none` | `none`, `wandb`, `tensorboard`, `swanlab`, `mlflow`, or `clearml`. |
 | `tracking.wandb_project` | `null` | W&B project. |
 | `tracking.wandb_name` | `null` | W&B run name. |
 | `tracking.wandb_key` | `null` | W&B API key; prefer the environment instead of committing it. |
@@ -386,6 +386,9 @@ unless tuning throughput or memory pressure.
 | `tracking.mlflow_tracking_uri` | `null` | MLflow tracking endpoint. |
 | `tracking.mlflow_experiment_name` | `null` | MLflow experiment. |
 | `tracking.mlflow_run_name` | `null` | MLflow run name. |
+| `tracking.clearml_project_name` | `null` | ClearML project; required when `report_to: clearml`. |
+| `tracking.clearml_jira_task` | `null` | Jira ticket used as the ClearML task name; required when `report_to: clearml`. |
+| `tracking.clearml_output_uri` | team S3 endpoint | Where ClearML uploads run artifacts. |
 
 ### `profiling`: bounded per-rank traces
 

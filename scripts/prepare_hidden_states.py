@@ -178,7 +178,17 @@ def parse_args():
         default=6,
         help="Gzip compression level (1-9).",
     )
-
+    others_group.add_argument(
+        "--clearml-upload",
+        action="store_true",
+        help="Enable periodic upload of completed files to S3 via ClearML StorageManager.",
+    )
+    others_group.add_argument(
+        "--s3-output-uri",
+        type=str,
+        default=None,
+        help="S3 base URI for ClearML upload, e.g. s3://bucket/path/to/run.",
+    )
     sglang_group = parser.add_argument_group("sglang")
     sglang_group.add_argument(
         "--sglang-attention-backend",
@@ -193,7 +203,10 @@ def parse_args():
     sglang_group.add_argument("--sglang-enable-dp-attention", action="store_true")
     sglang_group.add_argument("--sglang-enable-dp-lm-head", action="store_true")
     sglang_group.add_argument("--sglang-ep-size", type=int, default=1)
-    return parser.parse_args()
+    args = parser.parse_args()
+    if args.clearml_upload and not args.s3_output_uri:
+        parser.error("--s3-output-uri is required when --clearml-upload is set")
+    return args
 
 
 def _resolve_draft_vocab_size(source: str) -> int:
@@ -389,6 +402,7 @@ class HiddenStatesGenerator:
         file_group_size: int = 2000,
         compress: bool = False,
         compression_level: int = 6,
+        s3_output_uri: Optional[str] = None,
     ):
         """
         Args:
@@ -397,6 +411,7 @@ class HiddenStatesGenerator:
             num_io_threads: Number of threads for async I/O.
             io_queue_size: Max number of pending I/O futures before cleanup.
             file_group_size: Number of files per subdirectory.
+            s3_output_uri: S3 base URI for ClearML upload. If None, upload is disabled.
         """
         self.model = target_model
         self.capture_layout = capture_layout or OfflineCaptureLayout(
@@ -416,6 +431,13 @@ class HiddenStatesGenerator:
         self.compress = compress
         self.compression_level = compression_level
         self.file_extension = ".ckpt.gz" if self.compress else ".ckpt"
+
+        # --- S3 upload parameters ---
+        self.s3_output_uri = s3_output_uri
+        self._queued_for_upload: List[str] = []
+        self._current_upload_group: Optional[str] = None
+        self._upload_chunk_index: int = 0
+        self._output_path: Optional[str] = None
 
         # progress bar should only shown on TP rank = 0
         self.show_progress = dist.get_rank(get_tp_group()) == 0
@@ -437,6 +459,19 @@ class HiddenStatesGenerator:
             if self.show_progress:
                 print("\nWaiting for all async I/O operations to complete...")
             self._wait_all_saves()
+
+            # Final S3 upload flush for any remaining queued files
+            if (
+                self.s3_output_uri
+                and self._queued_for_upload
+                and self._output_path is not None
+            ):
+                self._upload_chunk_to_s3_and_delete(
+                    list(self._queued_for_upload), self._output_path
+                )
+                self._queued_for_upload.clear()
+                self._upload_chunk_index += 1
+
             self.io_executor.shutdown(wait=True)
             self.io_executor = None  # Reset for safety
 
@@ -517,6 +552,69 @@ class HiddenStatesGenerator:
             ):
                 future.result()  # Wait and raise exception if any
             self.pending_futures.clear()
+
+    def _upload_chunk_to_s3_and_delete(
+        self, files: List[str], output_path: str
+    ) -> None:
+        """Upload a list of local files to S3 via ClearML StorageManager and delete them."""
+        try:
+            from clearml import StorageManager
+        except ImportError:
+            print(
+                "Warning: clearml is not installed. Skipping S3 upload. "
+                "Install with: pip install clearml"
+            )
+            return
+
+        base_uri = self.s3_output_uri.rstrip("/")
+        output_path_norm = output_path.replace("\\", "/").rstrip("/")
+
+        def _upload_one(local_path: str):
+            local_norm = local_path.replace("\\", "/")
+            if local_norm.startswith(output_path_norm):
+                rel = local_norm[len(output_path_norm) :].lstrip("/")
+            else:
+                rel = os.path.basename(local_norm)
+            remote_url = f"{base_uri}/{rel}"
+            try:
+                StorageManager.upload_file(local_path, remote_url, wait_for_upload=True)
+                return local_path, True
+            except Exception as e:
+                print(f"Warning: Failed to upload {local_path} -> {remote_url}: {e}")
+                return local_path, False
+
+        chunk_idx = self._upload_chunk_index
+        print(f"\n[S3 Upload] Chunk {chunk_idx}: uploading {len(files)} files...")
+
+        uploaded, failed = [], []
+        with ThreadPoolExecutor(max_workers=8) as upload_executor:
+            for local_path, success in upload_executor.map(_upload_one, files):
+                if success:
+                    uploaded.append(local_path)
+                else:
+                    failed.append(local_path)
+
+        # Delete successfully uploaded files and try to clean empty parent dirs
+        deleted = 0
+        parent_dirs = set()
+        for local_path in uploaded:
+            try:
+                os.remove(local_path)
+                deleted += 1
+                parent_dirs.add(os.path.dirname(local_path))
+            except OSError as e:
+                print(f"Warning: Could not delete {local_path}: {e}")
+
+        for d in sorted(parent_dirs, reverse=True):
+            try:
+                os.rmdir(d)
+            except OSError:
+                pass  # Not empty or other error — leave it
+
+        print(
+            f"[S3 Upload] Chunk {chunk_idx}: "
+            f"uploaded={len(uploaded)}, failed={len(failed)}, deleted={deleted}"
+        )
 
     def _prepare_output_dirs(
         self, output_path: str, start_idx: int, total_samples: int
@@ -607,6 +705,7 @@ class HiddenStatesGenerator:
         - It avoids batching GPU-to-CPU transfers.
         - It ensures only one sample's data is in RAM for I/O at any given time.
         """
+        self._output_path = output_path
         self._prepare_output_dirs(output_path, start_idx, samples_per_dp)
 
         tp_group = get_tp_group()
@@ -729,7 +828,25 @@ class HiddenStatesGenerator:
                     output_file = self._get_file_path(output_path, current_global_idx)
                     self._save_tensor_async(record, output_file)
 
-                    # 4. Immediately clean up the single-sample CPU tensors
+                    # 4. Upload completed file groups to S3
+                    if self.s3_output_uri:
+                        file_group_dir = os.path.dirname(output_file)
+                        if (
+                            self._current_upload_group is not None
+                            and file_group_dir != self._current_upload_group
+                        ):
+                            # New group started — upload and delete the completed group
+                            self._wait_all_saves()
+                            files_to_upload = list(self._queued_for_upload)
+                            self._queued_for_upload.clear()
+                            self._upload_chunk_to_s3_and_delete(
+                                files_to_upload, output_path
+                            )
+                            self._upload_chunk_index += 1
+                        self._current_upload_group = file_group_dir
+                        self._queued_for_upload.append(output_file)
+
+                    # 5. Immediately clean up the single-sample CPU tensors
                     del last_hidden_states, aux_hidden_states
 
                 total_processed += len(sample_global_indices)
@@ -916,7 +1033,7 @@ def main():
             file_group_size=args.file_group_size,
             compress=args.compress,
             compression_level=args.compression_level,
-            # Other params like io_queue_size can also be added to argparse
+            s3_output_uri=args.s3_output_uri if args.clearml_upload else None,
         ) as hidden_states_generator:
 
             # Generate hidden states
