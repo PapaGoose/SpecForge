@@ -14,6 +14,13 @@ try:
 except ImportError:
     wandb = None
 
+# A local ``wandb/`` output directory is importable as a namespace package when
+# the real client is absent. Treat that case as an unavailable dependency too.
+if wandb is not None and not all(
+    callable(getattr(wandb, name, None)) for name in ("login", "init", "log", "finish")
+):
+    wandb = None
+
 try:
     from torch.utils.tensorboard import SummaryWriter
 except ImportError:
@@ -37,6 +44,17 @@ except ImportError:
 # --- End Lazy Imports ---
 
 
+def _public_config(args) -> Dict[str, Any]:
+    """Return tracker metadata without copying credentials into run logs."""
+    config = dict(vars(args))
+    for name in list(config):
+        lowered = name.lower()
+        if any(secret in lowered for secret in ("key", "token", "password")):
+            if config[name] is not None:
+                config[name] = "<redacted>"
+    return config
+
+
 class Tracker(abc.ABC):
     """
     Abstract Base Class for experiment trackers.
@@ -49,9 +67,9 @@ class Tracker(abc.ABC):
     def __init__(self, args, output_dir: str):
         self.args = args
         self.output_dir = output_dir
-        # In split mode, first draft rank handles logging instead of global rank 0
-        _override = getattr(args, "_tracker_rank", None)
-        self.rank = _override if _override is not None else dist.get_rank()
+        self.rank = (
+            dist.get_rank() if dist.is_available() and dist.is_initialized() else 0
+        )
         self.is_initialized = False
 
     @classmethod
@@ -101,14 +119,14 @@ class ClearmlTracker(Tracker):
     def validate_args(cls, parser, args):
         if clearml is None:
             parser.error(
-                "To use --report-to clearml, you must install clearml: 'pip install clearml'"
+                "To use tracking.report_to=clearml, you must install clearml: 'pip install clearml'"
             )
 
-        if args.clearml_project_name is None:
-            parser.error("Set project_name for your Task")
+        if getattr(args, "clearml_project_name", None) is None:
+            parser.error("Set tracking.clearml_project_name for your Task")
 
-        if args.clearml_jira_task is None:
-            parser.error("Set jira_task for your Task")
+        if getattr(args, "clearml_jira_task", None) is None:
+            parser.error("Set tracking.clearml_jira_task for your Task")
 
     def __init__(self, args, output_dir: str):
         super().__init__(args, output_dir)
@@ -116,7 +134,7 @@ class ClearmlTracker(Tracker):
             self.task = clearml.Task.init(
                 project_name=args.clearml_project_name,
                 task_name=f"[{args.clearml_jira_task}] Spec Dec Training",
-                output_uri="s3://storage.mwsapis.ru:443/clearml-fndrs/experiments",
+                output_uri=getattr(args, "clearml_output_uri", None),
                 reuse_last_task_id=False,
                 auto_connect_frameworks=False,
             )
@@ -139,12 +157,23 @@ class ClearmlTracker(Tracker):
 class WandbTracker(Tracker):
     """Tracks experiments using Weights & Biases."""
 
+    @staticmethod
+    def _default_wandb_dir() -> str:
+        # specforge/tracker.py -> project root is one level up
+        return os.path.normpath(os.path.join(os.path.dirname(__file__), "..", "wandb"))
+
     @classmethod
     def validate_args(cls, parser, args):
         if wandb is None:
             parser.error(
                 "To use --report-to wandb, you must install wandb: 'pip install wandb'"
             )
+
+        if args.wandb_dir is None:
+            args.wandb_dir = cls._default_wandb_dir()
+
+        if args.wandb_offline:
+            return
 
         if args.wandb_key is not None:
             return
@@ -175,11 +204,27 @@ class WandbTracker(Tracker):
 
     def __init__(self, args, output_dir: str):
         super().__init__(args, output_dir)
-        if self.rank == 0:
-            wandb.login(key=args.wandb_key)
-            wandb.init(
-                project=args.wandb_project, name=args.wandb_name, config=vars(args)
+        if wandb is None:
+            raise RuntimeError(
+                "To use --report-to wandb, install the W&B client: "
+                "'pip install wandb'."
             )
+        if self.rank == 0:
+            if args.wandb_dir is None:
+                args.wandb_dir = self._default_wandb_dir()
+            os.makedirs(args.wandb_dir, exist_ok=True)
+
+            if not args.wandb_offline:
+                wandb.login(key=args.wandb_key)
+            init_kwargs = {
+                "project": args.wandb_project,
+                "name": args.wandb_name,
+                "config": _public_config(args),
+                "dir": args.wandb_dir,
+            }
+            if args.wandb_offline:
+                init_kwargs["mode"] = "offline"
+            wandb.init(**init_kwargs)
             self.is_initialized = True
 
     def log(self, log_dict: Dict[str, Any], step: Optional[int] = None):
@@ -231,7 +276,7 @@ class SwanlabTracker(Tracker):
             swanlab.init(
                 project=args.swanlab_project,
                 experiment_name=args.swanlab_name,
-                config=vars(args),
+                config=_public_config(args),
                 logdir=swanlog_dir,
             )
             self.is_initialized = True
@@ -308,7 +353,7 @@ class MLflowTracker(Tracker):
             # This will either use the set URI or the default
             mlflow.set_experiment(args.mlflow_experiment_name)
             mlflow.start_run(run_name=args.mlflow_run_name)
-            mlflow.log_params(vars(args))
+            mlflow.log_params(_public_config(args))
             self.is_initialized = True
 
     def log(self, log_dict: Dict[str, Any], step: Optional[int] = None):

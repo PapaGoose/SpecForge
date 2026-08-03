@@ -1,0 +1,84 @@
+# Fork-local recipe: replaces the removed `--split-target-draft` mode of the old
+# `scripts/train_eagle3.py`.
+#
+# Old split mode put the target model on GPUs [0, tp_size) and the FSDP draft on
+# the remaining GPUs inside one torchrun job, moving hidden states over a private
+# NCCL transfer group. The unified runtime does the same split natively:
+# `deployment.disaggregated.managed_local` owns a patched SGLang capture server on
+# the target GPUs, a loopback Mooncake store for the feature tensors, and the
+# trainer workers on the draft GPUs — all from a single
+# `specforge train -c <this file>` invocation.
+#
+# Mapping from the old flags:
+#   --tp-size N        -> managed_local.capture_servers[0].tp_size (+ its N devices)
+#   --draft-dp-size M  -> deployment.trainer.nproc_per_node (draft GPU count)
+#   --report-to clearml -> tracking.report_to: clearml
+#
+# This file lives in examples/configs/local/ on purpose: upstream tests glob
+# examples/configs/*.yaml non-recursively, so fork-local recipes stay out of them.
+
+model:
+  # Point this at the target checkpoint the fork trains against. The draft config
+  # below is the fork-modified configs/llama3-8B-eagle3.json (hidden_size 5120,
+  # 40 heads, vocab_size 125800) and must stay consistent with the target.
+  target_model_path: "meta-llama/Llama-3.1-8B-Instruct"
+  draft_model_config: "configs/llama3-8B-eagle3.json"
+  vocab_mapping_path: "cache/vocab_mapping/llama3-8b-eagle3.pt"
+  target_backend: "sglang"
+  embedding_key: "model.embed_tokens.weight"
+  torch_dtype: "bfloat16"
+  sglang_mem_fraction_static: 0.5
+
+data:
+  train_data_path: "./cache/dataset/sharegpt_train.jsonl"
+  max_length: 4096
+  chat_template: "llama3"
+  build_dataset_num_proc: 32
+  cache_dir: "./cache"
+
+training:
+  strategy: "eagle3"
+  num_epochs: 10
+  max_steps: 10000
+  batch_size: 1
+  learning_rate: 0.0001
+  max_grad_norm: 0.5
+  ttt_length: 7
+  attention_backend: "sdpa"
+  save_interval: 1000
+  log_interval: 10
+  dist_timeout: 20
+  seed: 0
+
+tracking:
+  report_to: "clearml"
+  clearml_project_name: "spec-dec"
+  clearml_jira_task: "SET-ME"
+
+run_id: "llama3-8b-eagle3-split"
+output_dir: "./outputs/llama3-8b-eagle3-split"
+
+deployment:
+  mode: disaggregated
+  trainer:
+    nnodes: 1
+    # Draft GPUs: the old --draft-dp-size. Must match the length of
+    # managed_local.trainer_cuda_visible_devices below.
+    nproc_per_node: 7
+  disaggregated:
+    control_dir: outputs/llama3-8b-eagle3-split/control
+    consumer_state_dir: outputs/llama3-8b-eagle3-split/consumer-state
+    backend: mooncake
+    managed_local:
+      # Draft side — everything the old split mode gave to the FSDP trainer.
+      trainer_cuda_visible_devices: ["1", "2", "3", "4", "5", "6", "7"]
+      mooncake:
+        protocol: tcp
+        global_segment_size_bytes: 34359738368
+        local_buffer_size_bytes: 1073741824
+      capture_servers:
+        # Target side — the old --tp-size. Give it as many devices as tp_size.
+        - port: 30000
+          cuda_visible_devices: ["0"]
+          tp_size: 1
+          mem_fraction_static: 0.5

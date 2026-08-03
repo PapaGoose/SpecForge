@@ -9,16 +9,26 @@ from huggingface_hub import snapshot_download
 from safetensors import safe_open
 from transformers import AutoConfig
 
-from specforge.utils import padding
+from specforge.utils import get_local_device, padding
 
 
 class TargetHead(nn.Module):
-    def __init__(self, model_path, trust_remote_code: bool = False):
+    def __init__(
+        self,
+        model_path,
+        trust_remote_code: bool = False,
+        cache_dir: Optional[str] = None,
+    ):
         super().__init__()
         self.config = AutoConfig.from_pretrained(
-            model_path, trust_remote_code=trust_remote_code
+            model_path,
+            trust_remote_code=trust_remote_code,
+            cache_dir=cache_dir,
         )
-        self.fc = nn.Linear(self.config.hidden_size, self.config.vocab_size, bias=False)
+        self.hidden_size = self.config.hidden_size
+        self.vocab_size = self.config.vocab_size
+
+        self.fc = nn.Linear(self.hidden_size, self.vocab_size, bias=False)
 
     @classmethod
     def from_pretrained(
@@ -28,14 +38,20 @@ class TargetHead(nn.Module):
         cache_dir: Optional[str] = None,
         trust_remote_code: bool = False,
     ) -> "TargetHead":
-        target_head = cls(model_path, trust_remote_code=trust_remote_code)
+        target_head = cls(
+            model_path,
+            trust_remote_code=trust_remote_code,
+            cache_dir=cache_dir,
+        )
         target_head.load_weights(
             model_path=model_path,
             lm_head_key=lm_head_key,
             cache_dir=cache_dir,
         )
         target_head.freeze_weights()
-        target_head = target_head.eval().cuda().to(torch.bfloat16)
+        target_head = target_head.eval().to(
+            device=get_local_device(), dtype=torch.bfloat16
+        )
         return target_head
 
     @torch.no_grad()
@@ -48,7 +64,7 @@ class TargetHead(nn.Module):
         if os.path.exists(model_path):
             self.model_path = model_path
         else:
-            self.model_path = snapshot_download(repo_id=model_path)
+            self.model_path = snapshot_download(repo_id=model_path, cache_dir=cache_dir)
 
         # model_path is a local directory
         # check if there is file ending with index.json

@@ -22,31 +22,22 @@
 
 import gzip
 import io
+import json
 import os
 import re
 import warnings
 from collections import Counter
-from typing import Dict, List, Optional, Tuple, Union
+from typing import Callable, Dict, List, Optional, Tuple, Union
 
 import torch
 import torch.nn.functional as F
-from tqdm import tqdm
-from transformers import ImageProcessingMixin, PreTrainedTokenizer
-
 from datasets import Dataset as HFDataset
+from tqdm import tqdm
+from transformers import PreTrainedTokenizer
 
 from ..distributed import get_draft_sp_group, get_sp_ring_group
-
-try:
-    from qwen_vl_utils import process_vision_info
-
-    HAS_QWEN_VL_UTILS = True
-except ImportError:
-    HAS_QWEN_VL_UTILS = False
-    process_vision_info = None
-
-
-from .parse import GeneralParser, HarmonyParser, ThinkingParser
+from .loss_mask import has_consecutive_supervised_tokens
+from .parse import GeneralParser, GLMParser, HarmonyParser, ThinkingParser
 from .template import TEMPLATE_REGISTRY, ChatTemplate
 
 # define a type called conversation
@@ -122,6 +113,7 @@ def preprocess_conversations(
     max_length: int = 2048,
     is_preformatted: bool = False,
     train_only_last_turn: bool = False,
+    tools: Optional[List[List[Dict]]] = [[]],
     **kwargs,
 ) -> Dict[str, List[torch.Tensor]]:
     """
@@ -135,6 +127,7 @@ def preprocess_conversations(
         max_length: The maximum length of the tokenized input.
         is_preformatted: Whether the input is already formatted text strings.
         train_only_last_turn: If True, only the last assistant turn contributes to the loss.
+        tools: Optional list of tools information corresponding to each conversation, used for tool-use conversations.
 
     Returns:
         A dictionary containing:
@@ -142,24 +135,23 @@ def preprocess_conversations(
             - loss_mask: List of loss masks indicating which tokens should contribute to the loss.
             - attention_mask: List of attention masks.
     """
-
     # prepare result
     results = {"input_ids": [], "loss_mask": [], "attention_mask": []}
-
     if chat_template.parser_type == "general":
         parser = GeneralParser(tokenizer, chat_template)
     elif chat_template.parser_type == "thinking":
         parser = ThinkingParser(tokenizer, chat_template)
+    elif chat_template.parser_type == "glm":
+        parser = GLMParser(tokenizer, chat_template)
     elif chat_template.parser_type == "openai-harmony":
         parser = HarmonyParser(tokenizer, chat_template)
     else:
         raise ValueError(f"Invalid parser type: {chat_template.parser_type}")
-
     kwargs_list = [{} for _ in range(len(conversations))]
     for key, value_list in kwargs.items():
         for i, value in enumerate(value_list):
             kwargs_list[i][key] = value
-    for source, kwargs_item in zip(conversations, kwargs_list):
+    for source, tool, kwargs_item in zip(conversations, tools, kwargs_list):
         if not source:
             # if the source is None, skip it
             continue
@@ -168,127 +160,12 @@ def preprocess_conversations(
             max_length,
             preformatted=is_preformatted,
             train_only_last_turn=train_only_last_turn,
+            tool=tool,
             **kwargs_item,
         )
         results["input_ids"].append(input_ids[None, :])
         results["loss_mask"].append(loss_mask[None, :])
         results["attention_mask"].append(torch.ones_like(loss_mask)[None, :])
-    return results
-
-
-def preprocess_vlm_conversations(
-    processor: ImageProcessingMixin,
-    examples: List[Conversation],
-    chat_template: ChatTemplate,
-    max_length: int = 2048,
-) -> Dict[str, List[torch.Tensor]]:
-    """
-    Preprocess a batch of ShareGPT style conversations.
-
-    Args:
-        processor: The image processor to use for processing images.
-        examples: A list of examples, where each example is a dictionary containing:
-            - image: The image in the conversation.
-            - conversations: A list of conversations, where each conversation is a list of messages.
-        chat_template: The chat template to use for formatting the conversations.
-        max_length: The maximum length of the tokenized input.
-
-    Returns:
-        A dictionary containing:
-            - input_ids: List of tokenized input IDs.
-            - loss_mask: List of loss masks indicating which tokens should contribute to the loss.
-            - attention_mask: List of attention masks.
-            - pixel_values: List of pixel values for images in the examples.
-            - image_grid_thw: List of image grid tensors.
-    """
-    system_prompt = chat_template.system_prompt
-
-    # prepare result
-    results = {
-        "input_ids": [],
-        "loss_mask": [],
-        "attention_mask": [],
-        "pixel_values": [],
-        "image_grid_thw": [],
-    }
-
-    # Note: currently, we assume that each example has only one image
-    for i, image in enumerate(examples["image"]):
-        source = examples["conversations"][i]
-        messages = [{"role": "system", "content": system_prompt}]
-        if not source:
-            # if the source is None, skip it
-            continue
-
-        if source[0]["role"] != "user":
-            # if the first message is not from user, skip it
-            source = source[1:]
-
-        convroles = ["user", "assistant"]
-        for j, sentence in enumerate(source):
-            role = sentence["role"]
-            assert role == convroles[j % 2], f"unexpected role {role}"
-            if role == "user":
-                # if the message is from user and has image, process the image
-                messages.append(
-                    {
-                        "role": role,
-                        "content": [
-                            {
-                                "type": "image",
-                                "image": image,
-                            },
-                            {"type": "text", "text": sentence["content"]},
-                        ],
-                    }
-                )
-            else:
-                messages.append({"role": role, "content": sentence["content"]})
-
-        conversation = processor.apply_chat_template(
-            messages,
-            tokenize=False,
-            add_generation_prompt=False,
-        )
-        # get vision infor use qwen_vl_utils
-        if not HAS_QWEN_VL_UTILS:
-            raise ImportError(
-                "qwen_vl_utils is required for VLM preprocessing but is not installed. "
-                "Please install it to use VLM features."
-            )
-        image_inputs, video_inputs = process_vision_info(messages)
-        assert image_inputs is not None, "image_inputs must not be None"
-
-        encoding = processor(
-            text=[conversation],
-            images=image_inputs,
-            videos=video_inputs,
-            max_length=max_length,
-            truncation=True,
-            return_tensors="pt",
-            return_offsets_mapping=True,
-            add_special_tokens=False,
-        )
-        input_ids = encoding.input_ids[0]
-        offsets = encoding.offset_mapping[0]
-        pixel_values = encoding.pixel_values
-        image_grid_thw = encoding.image_grid_thw[0]
-
-        # get conversation with image info for loss mask generation
-        decoded_conversation = processor.tokenizer.decode(
-            encoding.input_ids[0], skip_special_tokens=False
-        )
-
-        # Apply loss mask
-        loss_mask = _apply_loss_mask_from_chat_template(
-            decoded_conversation, offsets, chat_template
-        )
-
-        results["input_ids"].append(input_ids[None, :])
-        results["loss_mask"].append(loss_mask[None, :])
-        results["attention_mask"].append(torch.ones_like(loss_mask)[None, :])
-        results["pixel_values"].append(pixel_values)
-        results["image_grid_thw"].append(image_grid_thw[None, :])
     return results
 
 
@@ -301,10 +178,10 @@ def build_eagle3_dataset(
     num_proc: Optional[int] = 8,
     cache_dir: Optional[str] = None,
     cache_key: Optional[str] = None,
-    is_vlm: Optional[bool] = False,
-    processor: Optional[ImageProcessingMixin] = None,
     is_preformatted: Optional[bool] = False,
     train_only_last_turn: Optional[bool] = False,
+    minimum_valid_tokens: Optional[int] = None,
+    loss_mask_filter: Optional[Callable[[object], bool]] = None,
 ) -> HFDataset:
     """
     build eagle3 dataset
@@ -321,8 +198,6 @@ def build_eagle3_dataset(
         num_proc: The number of processes to use for multiprocessing.
         cache_dir: The directory to use for caching the processed dataset.
         cache_key: The key to use for caching the processed dataset.
-        is_vlm: Whether the dataset is for VLM models.
-        processor: The image processor to use for processing images.
         is_preformatted: Whether the dataset contains preformatted text of the conversation
                         (e.g. includes system prompt, user and assistant start and end tokens)
                         and doesn't need to have the chat template applied.
@@ -332,12 +207,17 @@ def build_eagle3_dataset(
                         If False, expects "conversations" column with ShareGPT format.
         train_only_last_turn: If True, only the last assistant turn contributes to the loss.
                              Useful for thinking models where history may not contain thoughts.
+        minimum_valid_tokens: If set, drops samples with fewer trainable tokens.
+        loss_mask_filter: Optional algorithm-owned predicate applied after
+                          tokenization and truncation.
 
     Returns:
         The processed HF dataset.
     """
-    if is_vlm:
-        assert processor is not None, "processor must be provided when is_vlm is True"
+    if minimum_valid_tokens is not None and minimum_valid_tokens < 0:
+        raise ValueError("minimum_valid_tokens must be >= 0")
+    if loss_mask_filter is not None and not callable(loss_mask_filter):
+        raise TypeError("loss_mask_filter must be callable or None")
 
     # Validate chat_template requirement
     if chat_template is None:
@@ -354,14 +234,7 @@ def build_eagle3_dataset(
 
     def preprocess_function(examples):
         # Handle different dataset formats
-        if is_vlm:
-            processed = preprocess_vlm_conversations(
-                processor,
-                examples,
-                template,
-                max_length,
-            )
-        elif is_preformatted:
+        if is_preformatted:
             # Handle pre-formatted text (should be in "text" column)
             if "text" not in examples:
                 raise ValueError(
@@ -374,6 +247,7 @@ def build_eagle3_dataset(
                 max_length,
                 is_preformatted=True,
                 train_only_last_turn=train_only_last_turn,
+                tools=[[] for _ in range(len(examples["text"]))],
             )
         else:
             # Handle ShareGPT conversations
@@ -384,6 +258,30 @@ def build_eagle3_dataset(
             conversations = examples.pop("conversations")
             if "id" in examples:
                 examples.pop("id")
+            if "tools" in examples:
+                tools_raw = examples.pop("tools")
+                # Parse tools: handle JSON strings from safe_conversations_generator
+                tools = []
+                for tool_item in tools_raw:
+                    if isinstance(tool_item, str):
+                        try:
+                            tools.append(json.loads(tool_item))
+                        except json.JSONDecodeError:
+                            warnings.warn(
+                                f"Failed to parse tools JSON string: {tool_item[:100]}..."
+                            )
+                            tools.append([])
+                    elif isinstance(tool_item, list):
+                        tools.append(tool_item)
+                    elif tool_item is None:
+                        tools.append([])
+                    else:
+                        warnings.warn(
+                            f"Unexpected tools type: {type(tool_item)}, using empty list"
+                        )
+                        tools.append([])
+            else:
+                tools = [[] for _ in range(len(conversations))]
             processed = preprocess_conversations(
                 tokenizer,
                 conversations,
@@ -391,6 +289,7 @@ def build_eagle3_dataset(
                 max_length,
                 is_preformatted=False,
                 train_only_last_turn=train_only_last_turn,
+                tools=tools,
                 **examples,
             )
 
@@ -411,23 +310,60 @@ def build_eagle3_dataset(
             f"cache_dir and cache_key must be provided together to make caching work"
         )
 
-    # adjust batch size based on dataset type
-    if is_vlm:
-        batch_size = (
-            200  # reduce batch size for VLM datasets to avoid PyArrow offset overflow
-        )
-    else:
-        batch_size = 1000  # default for conversations
+    # Disable tokenizers internal parallelism when using multiprocessing to avoid
+    # deadlocks caused by forked Rust threads (see huggingface/tokenizers#1391).
+    if num_proc is not None and num_proc > 1:
+        os.environ["TOKENIZERS_PARALLELISM"] = "false"
+
     dataset = dataset.map(
         preprocess_function,
         batched=True,
         num_proc=num_proc,
-        batch_size=batch_size,
+        batch_size=1000,
         remove_columns=original_cols,
         # keep_in_memory=True,
         load_from_cache_file=load_from_cache_file,
         cache_file_name=cache_file_name,
     )
+
+    if minimum_valid_tokens is not None:
+        before_filter = len(dataset)
+
+        def has_minimum_valid_tokens(example):
+            loss_mask = example["loss_mask"]
+            if isinstance(loss_mask, torch.Tensor):
+                valid_tokens = int(loss_mask.sum().item())
+            else:
+                valid_tokens = sum(
+                    int(token)
+                    for row in loss_mask
+                    for token in (row if isinstance(row, list) else [row])
+                )
+            return valid_tokens >= minimum_valid_tokens
+
+        dataset = dataset.filter(
+            has_minimum_valid_tokens,
+            num_proc=num_proc,
+            desc=f"Filtering samples with >= {minimum_valid_tokens} trainable tokens",
+        )
+        print(
+            f"Filtered dataset by trainable tokens: {before_filter} -> {len(dataset)}"
+        )
+
+    if loss_mask_filter is not None:
+        before_filter = len(dataset)
+
+        def has_eligible_loss_mask(example):
+            return loss_mask_filter(example["loss_mask"])
+
+        dataset = dataset.filter(
+            has_eligible_loss_mask,
+            num_proc=num_proc,
+            desc="Filtering samples by algorithm loss-mask eligibility",
+        )
+        print(
+            f"Filtered dataset by loss-mask eligibility: {before_filter} -> {len(dataset)}"
+        )
 
     dataset.set_format(type="torch")
     return dataset
@@ -570,13 +506,15 @@ class OfflineEagle3Dataset(torch.utils.data.Dataset):
         new_data["attention_mask"] = attention_mask
 
         # Position ids should align with Ulysses all2all-expanded sequence length.
-        # Local seq_len (per sp_rank) = local_len; attention uses (local_len - ttt_length).
+        # Within each ring group there are sp_ulysses_size Ulysses peers; each holds a
+        # distinct usp_chunk_size slice, so position IDs must differ by ulysses_rank offset.
         sp_ulysses_size = max(1, sp_size // sp_ring_size)
         usp_chunk_size = max(local_len - ttt_length, 0)
         ring_chunk = usp_chunk_size * sp_ulysses_size
-        ring_start = ring_rank * ring_chunk
+        ulysses_rank = sp_rank % sp_ulysses_size
+        ring_start = ring_rank * ring_chunk + ulysses_rank * usp_chunk_size
         new_data["position_ids"] = torch.arange(
-            ring_start, ring_start + ring_chunk, dtype=torch.long
+            ring_start, ring_start + usp_chunk_size, dtype=torch.long
         ).unsqueeze(0)
 
         if transform:
@@ -700,6 +638,83 @@ def generate_vocab_mapping_file(
     torch.save(vocab_mapping, vocab_mapping_path)
     print(f"Saved vocab mapping to: {vocab_mapping_path}")
     return vocab_mapping_path
+
+
+def process_offline_eagle3_sample(
+    raw: Dict[str, torch.Tensor], max_len: int
+) -> Dict[str, torch.Tensor]:
+    """Normalize one prepared EAGLE3 feature sample for the canonical loader.
+
+    Hidden-state preparation stores the target final state under
+    hidden_state and auxiliary layers under aux_hidden_state. Training consumes
+    those tensors as target and hidden_state respectively.
+    """
+    hidden_state = raw["aux_hidden_state"].squeeze(0)[:max_len].unsqueeze(0)
+    target = raw["hidden_state"].squeeze(0)[:max_len].unsqueeze(0)
+    input_ids = raw["input_ids"][:max_len].unsqueeze(0)
+    loss_mask = raw["loss_mask"][:max_len].clone().unsqueeze(0)
+    if loss_mask.numel() > 0:
+        loss_mask[0, -1] = 0
+
+    return {
+        "attention_mask": torch.ones_like(loss_mask, dtype=torch.long),
+        "loss_mask": loss_mask,
+        "target": target,
+        "hidden_state": hidden_state,
+        "input_ids": input_ids,
+    }
+
+
+def process_offline_dflash_sample(
+    raw: Dict[str, torch.Tensor], max_len: int
+) -> Dict[str, torch.Tensor]:
+    """Normalize one prepared DFlash-family feature sample.
+
+    DFlash and Domino consume the same capture contract: token ids, a loss
+    mask, and the concatenated target-layer states.  Unlike EAGLE3, there is no
+    auxiliary/final-state swap and no target distribution.  Offline feature
+    files may store ``hidden_states`` as either ``[seq, width]`` or
+    ``[1, seq, width]``; the canonical loader always receives a leading batch
+    dimension.
+    """
+    input_ids = raw["input_ids"][:max_len].unsqueeze(0)
+    loss_mask = raw["loss_mask"][:max_len].unsqueeze(0)
+    hidden_states = raw["hidden_states"]
+    if hidden_states.dim() == 3:
+        if hidden_states.shape[0] != 1:
+            raise ValueError(
+                "offline DFlash hidden_states must have shape [seq, width] or "
+                f"[1, seq, width], got {tuple(hidden_states.shape)}"
+            )
+        hidden_states = hidden_states.squeeze(0)
+    if hidden_states.dim() != 2:
+        raise ValueError(
+            "offline DFlash hidden_states must have shape [seq, width] or "
+            f"[1, seq, width], got {tuple(hidden_states.shape)}"
+        )
+    hidden_states = hidden_states[:max_len].unsqueeze(0)
+
+    sequence_lengths = {
+        input_ids.shape[1],
+        loss_mask.shape[1],
+        hidden_states.shape[1],
+    }
+    if len(sequence_lengths) != 1:
+        raise ValueError(
+            "offline DFlash features have mismatched sequence lengths after "
+            f"truncation: input_ids={input_ids.shape[1]}, "
+            f"loss_mask={loss_mask.shape[1]}, "
+            f"hidden_states={hidden_states.shape[1]}"
+        )
+    if not has_consecutive_supervised_tokens(loss_mask[0]):
+        raise ValueError(
+            "offline DFlash samples require two consecutive supervised tokens"
+        )
+    return {
+        "input_ids": input_ids,
+        "loss_mask": loss_mask,
+        "hidden_states": hidden_states,
+    }
 
 
 def process_token_dict_to_mappings(

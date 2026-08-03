@@ -18,10 +18,42 @@ SpecForge is an ecosystem project developed by the SGLang team. It is a framewor
 We have seen many open-source projects for speculative decoding, but most of them are not well-maintained or not directly compatible with SGLang. We prepared this project because we wish that the open-source community can enjoy a speculative decoding framework that is
 - regularly maintained by the SpecForge team: the code is runnable out-of-the-box
 - directly compatible with SGLang: there is no additional efforts for porting to SGLang
-- provide performant training capabilities: we provided online/offline/tensor-parallel/FSDP to suit your needs
+- provides local offline and server-only online-disaggregated training through
+  one runtime, including the supported data, tensor, and sequence parallel
+  topologies
 
 
 Check out [**our documentation**](https://docs.sglang.ai/SpecForge/) to get started.
+
+
+## 🔧 Supported Methods
+
+Every method uses the same typed training entry point:
+
+```bash
+specforge train --config examples/configs/qwen3-8b-eagle3-disaggregated.yaml
+```
+
+The typed `deployment.trainer` topology self-launches trainer DP and EAGLE3
+offline USP process groups. A single-node disaggregated config also supervises
+its SpecForge producer and consumer; Mooncake and SGLang remain externally
+managed services, and online target parallelism belongs to SGLang. There are no
+method-specific Python training entry points.
+
+| Method | Description | Example config | Optimization |
+| --- | --- | --- | --- |
+| **[EAGLE3](https://arxiv.org/abs/2503.01840)** | Feature-based autoregressive drafting | [Online](./examples/configs/qwen3-8b-eagle3-disaggregated.yaml) / [Offline](./examples/configs/qwen3-8b-eagle3-offline.yaml) / [Disaggregated offline](./examples/configs/qwen3-8b-eagle3-offline-disaggregated.yaml) | [LK loss](https://arxiv.org/pdf/2602.23881) |
+| **[P-EAGLE](https://arxiv.org/abs/2602.01469)** | Parallel EAGLE | [Online](./examples/configs/qwen3-8b-peagle-disaggregated.yaml) | — |
+| **EAGLE3.1** | Feature-based autoregressive drafting with attention drift | [Online](./examples/configs/qwen3-30b-a3b-eagle3.1-online.yaml) | — |
+| **[DFlash](https://arxiv.org/abs/2602.06036)** | Block-parallel drafting | [Online](./examples/configs/qwen3-8b-dflash-online.yaml) / [Disaggregated](./examples/configs/qwen3-8b-dflash-disaggregated.yaml) | [D-PACE](https://arxiv.org/abs/2605.18810) |
+| **[Domino](https://arxiv.org/html/2605.29707v1)** | DFlash with GRU logit correction | [Online](./examples/configs/qwen3-8b-domino-online.yaml) / [Disaggregated](./examples/configs/qwen3-8b-domino-disaggregated.yaml) | — |
+| **[DSpark](https://arxiv.org/abs/2607.05147)** | Confidence-Scheduled Semi-Autoregressive Generation | [Disaggregated](./examples/configs/qwen3-4b-dspark-disaggregated.yaml) | — |
+
+See the [training guide](./docs/basic_usage/training.md) for the supported
+method/topology matrix and the
+[disaggregated guide](./docs/basic_usage/disaggregated_training.md) for the
+online/offline launch workflows. Unsupported combinations are rejected during
+config validation or run assembly instead of falling back to an older trainer.
 
 
 ## 🚀 Accelerate with SpecBundle
@@ -38,8 +70,10 @@ SpecBundle is a collection of production-grade speculative decoding models that 
 
 ## 🎉 News
 
+- [2026-06] 🔥 Added D-PACE as an optional loss for DFlash training.
+- [2026-06] 🔥 Added Domino online training for DFlash draft models.
+- [2026-01] 🔥 Added DFlash block-parallel online training with SGLang serving support.
 - [2025-12] 🎉 Released SpecBundle (phase 1) and SpecForge v0.2. Check out our blog at [LMSYS.org](https://lmsys.org/blog/2025-12-23-spec-bundle-phase-1/)
-- [2025-12] 🔔 Released the roadmap for 2026 Q1.
 - [2025-08] 🔔 SpecForge is listed as a [flagship project](https://lmsys.org/about/) in LMSYS. Congratulations to the SpecForge team!
 - [2025-08] 🔥 SpecForge powered the Eagle3 draft model for GPT-OSS. Check out the blog at [LMSYS.org](https://lmsys.org/blog/2025-08-27-gpt-oss/)
 - [2025-07] 🔥 SpecForge is released together with Llama4-Eagle3 checkpoints. Check out our blog at [LMSYS.org](https://lmsys.org/blog/2025-07-25-spec-forge/)
@@ -61,6 +95,13 @@ We would like to extend our sincere thanks to [Voltage Park](https://www.voltage
 ## 📃 Citation
 
 ```bibtex
+@article{li2026specforge,
+  title={{SpecForge}: A flexible and efficient open-source training framework for speculative decoding},
+  author={Li, Shenggui and Wang, Chao and Zhu, Yikai and Wang, Yubo and Yin, Fan and Shi, Shuai and Chen, Yefei and Dong, Xiaomin and Chen, Qiaoling and Pan, Jin and others},
+  journal={arXiv preprint arXiv:2603.18567},
+  year={2026}
+}
+
 @misc{specforge2025,
   title={SpecForge: Train speculative decoding models effortlessly},
   author={Shenggui Li, Yikai Zhu, Chao Wang, Fan Yin, Shuai Shi, Yubo Wang, Yi Zhang, Yingyi Huang, Haoshuai Zheng, Yineng Zhang},
@@ -68,3 +109,4 @@ We would like to extend our sincere thanks to [Voltage Park](https://www.voltage
   publisher={GitHub},
   howpublished={\url{https://github.com/sgl-project/specforge}},
 }
+```

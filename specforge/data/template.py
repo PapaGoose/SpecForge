@@ -1,5 +1,5 @@
 # Adapted from: https://github.com/sgl-project/sglang/blob/main/python/sglang/lang/chat_template.py#L13
-from typing import List
+from typing import List, Optional
 
 from pydantic import BaseModel
 
@@ -13,15 +13,17 @@ class ChatTemplate(BaseModel):
         user_header(str): The header for the user.
         system_prompt(str): The system prompt.
         end_of_turn_token(str): The end token of a turn of conversation.
+        ignore_token(List[str]): The list of tokens to ignore when parsing the model output, e.g., for thinking token.
     """
 
-    assistant_header: str | None
-    user_header: str | None
-    system_prompt: str | None
-    end_of_turn_token: str | None
+    assistant_header: Optional[str] = None
+    user_header: Optional[str] = None
+    system_prompt: Optional[str] = None
+    end_of_turn_token: Optional[str] = None
     parser_type: str = "general"
     assistant_pattern_type: str = "general"
     enable_thinking: bool = False
+    ignore_token: Optional[List[str]] = None
 
 
 class TemplateRegistry:
@@ -57,7 +59,7 @@ class TemplateRegistry:
             override(bool): Whether to override the existing template, default to False
         """
         assert (
-            not override and name not in self.templates
+            override or name not in self.templates
         ), f"Chat template for the model type {name} has already been registered"
         self.templates[name] = template
 
@@ -118,11 +120,11 @@ TEMPLATE_REGISTRY.register(
 )
 
 TEMPLATE_REGISTRY.register(
-    name="qwen2-vl",
+    name="lfm",
     template=ChatTemplate(
         assistant_header="<|im_start|>assistant\n",
         user_header="<|im_start|>user\n",
-        system_prompt="You are a helpful assistant.",
+        system_prompt="",
         end_of_turn_token="<|im_end|>\n",
     ),
 )
@@ -205,10 +207,11 @@ TEMPLATE_REGISTRY.register(
 TEMPLATE_REGISTRY.register(
     name="qwen3-instruct",
     template=ChatTemplate(
-        assistant_header="<|im_start|>assistant\n<think>\n\n</think>\n",
+        assistant_header="<|im_start|>assistant\n",
         user_header="<|im_start|>user\n",
         system_prompt="You are a helpful assistant.",
         end_of_turn_token="<|im_end|>\n",
+        ignore_token=["<think>\n\n</think>\n\n"],
     ),
 )
 
@@ -256,6 +259,19 @@ TEMPLATE_REGISTRY.register(
     ),
 )
 
+# DeepSeek-V2-Lite's tokenizer renders plain-text role headers. They must not
+# reuse DeepSeek-V3's special-token headers or the assistant loss mask will be
+# anchored at text that never appears in the rendered conversation.
+TEMPLATE_REGISTRY.register(
+    name="deepseek-v2",
+    template=ChatTemplate(
+        assistant_header="Assistant: ",
+        user_header="User: ",
+        system_prompt=None,
+        end_of_turn_token="<｜end▁of▁sentence｜>",
+    ),
+)
+
 TEMPLATE_REGISTRY.register(
     name="ling-flash-2.0",
     template=ChatTemplate(
@@ -275,6 +291,19 @@ TEMPLATE_REGISTRY.register(
         end_of_turn_token="<｜end▁of▁sentence｜>",
         parser_type="thinking",
         enable_thinking=True,
+    ),
+)
+
+TEMPLATE_REGISTRY.register(
+    name="glm-5.2",
+    template=ChatTemplate(
+        assistant_header="<|assistant|><think>",
+        user_header="<|user|>",
+        system_prompt=None,
+        end_of_turn_token="<|user|>",
+        parser_type="glm",
+        assistant_pattern_type="glm",
+        ignore_token=["<|user|>"],
     ),
 )
 
@@ -306,5 +335,36 @@ TEMPLATE_REGISTRY.register(
         user_header="<longcat_user>",
         system_prompt="You are a helpful assistant.",
         end_of_turn_token="</longcat_s>",
+    ),
+)
+
+
+TEMPLATE_REGISTRY.register(
+    name="qwen3.5",
+    template=ChatTemplate(
+        assistant_header="<|im_start|>assistant\n<think>\n",
+        user_header="<|im_start|>user\n",
+        system_prompt="",
+        end_of_turn_token="<|im_end|>\n",
+        parser_type="thinking",
+        enable_thinking=True,
+    ),
+)
+
+TEMPLATE_REGISTRY.register(
+    name="inkling-thinking",
+    template=ChatTemplate(
+        assistant_header="<|message_model|>",
+        user_header="<|message_user|>",
+        system_prompt=None,
+        end_of_turn_token="<|message_user|>",
+        parser_type="thinking",
+        assistant_pattern_type="inkling",
+        enable_thinking=True,
+        ignore_token=[
+            "<|message_user|>",
+            "<|message_tool|>",
+            "<|message_system|>",
+        ],
     ),
 )

@@ -10,14 +10,19 @@ from transformers.models.qwen3.modeling_qwen3 import (
     FlashAttentionKwargs,
     GradientCheckpointingLayer,
     Qwen3Config,
-    Qwen3MLP,
     Qwen3PreTrainedModel,
-    Qwen3RMSNorm,
     Qwen3RotaryEmbedding,
     eager_attention_forward,
     rotate_half,
 )
 from typing_extensions import Tuple, Unpack
+
+from .dflash_kernels import DEFAULT_DFLASH_KERNELS, DFlashKernels
+from .registry import register_draft
+
+FULL_ATTENTION = "full_attention"
+SLIDING_ATTENTION = "sliding_attention"
+_VALID_DFLASH_LAYER_TYPES = {FULL_ATTENTION, SLIDING_ATTENTION}
 
 
 def sample(logits: torch.Tensor, temperature: float = 0.0) -> torch.Tensor:
@@ -30,6 +35,39 @@ def sample(logits: torch.Tensor, temperature: float = 0.0) -> torch.Tensor:
     return torch.multinomial(probs, num_samples=1).view(bsz, seq_len)
 
 
+def resolve_dflash_attention_layout(
+    config: Qwen3Config,
+) -> tuple[tuple[str, ...], Optional[int]]:
+    """Validate and return the configured per-layer DFlash attention layout."""
+
+    num_hidden_layers = config.num_hidden_layers
+    layer_types = tuple(config.layer_types)
+
+    if len(layer_types) != num_hidden_layers:
+        raise ValueError(
+            "DFlash config.layer_types must contain exactly "
+            f"num_hidden_layers={num_hidden_layers} entries, got "
+            f"{len(layer_types)}"
+        )
+    invalid = set(layer_types) - _VALID_DFLASH_LAYER_TYPES
+    if invalid:
+        raise ValueError(
+            "DFlash config.layer_types supports only full_attention and "
+            f"sliding_attention, got {sorted(invalid)}"
+        )
+
+    if SLIDING_ATTENTION not in layer_types:
+        return layer_types, None
+
+    sliding_window = config.sliding_window
+    if sliding_window is None or sliding_window <= 0:
+        raise ValueError(
+            "DFlash sliding_attention layers require use_sliding_window=true "
+            "and a positive config.sliding_window"
+        )
+    return layer_types, sliding_window
+
+
 def apply_rotary_pos_emb(q, k, cos, sin, position_ids=None, unsqueeze_dim=1):
     cos = cos.unsqueeze(unsqueeze_dim)
     sin = sin.unsqueeze(unsqueeze_dim)
@@ -39,10 +77,32 @@ def apply_rotary_pos_emb(q, k, cos, sin, position_ids=None, unsqueeze_dim=1):
     return q_embed, k_embed
 
 
+def _prepare_dflash_eager_mask(
+    attention_mask: Optional[torch.Tensor],
+    dtype: torch.dtype,
+) -> tuple[Optional[torch.Tensor], Optional[torch.Tensor]]:
+    """Convert a boolean allow-mask to eager's additive representation."""
+
+    if attention_mask is None or attention_mask.dtype != torch.bool:
+        return attention_mask, None
+
+    valid_queries = attention_mask.any(dim=-1, keepdim=True)
+    # A finite minimum keeps eager softmax stable. Fully masked query rows are
+    # explicitly zeroed after attention so they cannot average forbidden values.
+    additive_mask = torch.zeros_like(attention_mask, dtype=dtype)
+    additive_mask.masked_fill_(~attention_mask, torch.finfo(dtype).min)
+    return additive_mask, valid_queries
+
+
 class Qwen3DFlashAttention(nn.Module):
     """Multi-headed attention from 'Attention Is All You Need' paper"""
 
-    def __init__(self, config: Qwen3Config, layer_idx: int):
+    def __init__(
+        self,
+        config: Qwen3Config,
+        layer_idx: int,
+        kernels: DFlashKernels,
+    ):
         super().__init__()
         self.config = config
         self.layer_idx = layer_idx
@@ -75,11 +135,11 @@ class Qwen3DFlashAttention(nn.Module):
             config.hidden_size,
             bias=config.attention_bias,
         )
-        self.q_norm = Qwen3RMSNorm(self.head_dim, eps=config.rms_norm_eps)
-        self.k_norm = Qwen3RMSNorm(self.head_dim, eps=config.rms_norm_eps)
+        self.q_norm = kernels.make_rms_norm(self.head_dim, config.rms_norm_eps)
+        self.k_norm = kernels.make_rms_norm(self.head_dim, config.rms_norm_eps)
         self.sliding_window = (
             config.sliding_window
-            if config.layer_types[layer_idx] == "sliding_attention"
+            if config.layer_types[layer_idx] == SLIDING_ATTENTION
             else None
         )
 
@@ -115,8 +175,14 @@ class Qwen3DFlashAttention(nn.Module):
         if past_key_values is not None:
             cache_kwargs = {"sin": sin, "cos": cos, "cache_position": cache_position}
             k, v = past_key_values.update(k, v, self.layer_idx, cache_kwargs)
+        valid_queries = None
         attn_fn: Callable = eager_attention_forward
-        if self.config._attn_implementation != "eager":
+        if self.config._attn_implementation == "eager":
+            attention_mask, valid_queries = _prepare_dflash_eager_mask(
+                attention_mask,
+                q.dtype,
+            )
+        else:
             attn_fn = ALL_ATTENTION_FUNCTIONS[self.config._attn_implementation]
         attn_output, attn_weights = attn_fn(
             self,
@@ -129,20 +195,38 @@ class Qwen3DFlashAttention(nn.Module):
             sliding_window=self.sliding_window,
             **kwargs,
         )
+        if valid_queries is not None and attn_weights is not None:
+            attn_weights = attn_weights.masked_fill(~valid_queries, 0)
         attn_output = attn_output.reshape(bsz, q_len, -1)
         attn_output = self.o_proj(attn_output)
+        if valid_queries is not None:
+            attn_output = attn_output.masked_fill(
+                ~valid_queries.any(dim=1),
+                0,
+            )
         return attn_output, attn_weights
 
 
 class Qwen3DFlashDecoderLayer(GradientCheckpointingLayer):
-    def __init__(self, config: Qwen3Config, layer_idx: int):
+    def __init__(
+        self,
+        config: Qwen3Config,
+        layer_idx: int,
+        kernels: DFlashKernels,
+    ):
         super().__init__()
         self.hidden_size = config.hidden_size
-        self.self_attn = Qwen3DFlashAttention(config=config, layer_idx=layer_idx)
-        self.mlp = Qwen3MLP(config)
-        self.input_layernorm = Qwen3RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
-        self.post_attention_layernorm = Qwen3RMSNorm(
-            config.hidden_size, eps=config.rms_norm_eps
+        self.self_attn = Qwen3DFlashAttention(
+            config=config,
+            layer_idx=layer_idx,
+            kernels=kernels,
+        )
+        self.mlp = kernels.make_mlp(config)
+        self.input_layernorm = kernels.make_rms_norm(
+            config.hidden_size, config.rms_norm_eps
+        )
+        self.post_attention_layernorm = kernels.make_rms_norm(
+            config.hidden_size, config.rms_norm_eps
         )
 
     def forward(
@@ -186,7 +270,7 @@ class Qwen3DFlashDecoderLayer(GradientCheckpointingLayer):
 
 def build_target_layer_ids(num_target_layers: int, num_draft_layers: int):
     if num_draft_layers == 1:
-        return [(num_target_layers // 2)]
+        return [num_target_layers // 2]
     start = 1
     end = num_target_layers - 3
     span = end - start
@@ -209,16 +293,62 @@ def extract_context_feature(
     return target_hidden
 
 
+def normalize_draft_head_checkpoint_keys(
+    module,
+    state_dict,
+    prefix,
+    local_metadata,
+    strict,
+    missing_keys,
+    unexpected_keys,
+    error_msgs,
+):
+    """Map checkpoint-only nested head names onto the direct module layout.
+
+    Early Domino/DSpark checkpoints saved their auxiliary heads beneath a
+    ``logit_head`` container. The live architecture no longer owns that wrapper,
+    but those tensors remain valid and must not be dropped during warm start or
+    full resume.
+    """
+
+    del module, local_metadata, strict, missing_keys, unexpected_keys, error_msgs
+    checkpoint_prefixes = (
+        ("logit_head.prefix_gru.", "prefix_gru."),
+        ("logit_head.embed_proj.", "embed_proj."),
+        ("logit_head.markov_head.", "markov_head."),
+        ("logit_head.confidence_head.", "confidence_head."),
+    )
+    for key in list(state_dict):
+        if not key.startswith(prefix):
+            continue
+        local_key = key[len(prefix) :]
+        for checkpoint_prefix, model_prefix in checkpoint_prefixes:
+            if not local_key.startswith(checkpoint_prefix):
+                continue
+            normalized_key = prefix + model_prefix + local_key[len(checkpoint_prefix) :]
+            if normalized_key not in state_dict:
+                state_dict[normalized_key] = state_dict[key]
+            state_dict.pop(key)
+            break
+
+
+@register_draft
 class DFlashDraftModel(Qwen3PreTrainedModel):
     config_class = Qwen3Config
     _no_split_modules = ["Qwen3DFlashDecoderLayer"]
 
-    def __init__(self, config) -> None:
+    def __init__(
+        self,
+        config,
+        dflash_kernels: Optional[DFlashKernels] = None,
+    ) -> None:
         super().__init__(config)
         self.config = config
+        self.layer_types, self.sliding_window = resolve_dflash_attention_layout(config)
+        kernels = dflash_kernels or DEFAULT_DFLASH_KERNELS
         self.layers = nn.ModuleList(
             [
-                Qwen3DFlashDecoderLayer(config, layer_idx)
+                Qwen3DFlashDecoderLayer(config, layer_idx, kernels)
                 for layer_idx in range(config.num_hidden_layers)
             ]
         )
@@ -227,22 +357,81 @@ class DFlashDraftModel(Qwen3PreTrainedModel):
             "target_layer_ids",
             build_target_layer_ids(config.num_target_layers, config.num_hidden_layers),
         )
-        self.norm = Qwen3RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+        self.norm = kernels.make_rms_norm(config.hidden_size, config.rms_norm_eps)
         self.rotary_emb = Qwen3RotaryEmbedding(config)
         self.fc = nn.Linear(
             len(self.target_layer_ids) * config.hidden_size,
             config.hidden_size,
             bias=False,
         )
-        self.hidden_norm = Qwen3RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+        self.hidden_norm = kernels.make_rms_norm(
+            config.hidden_size, config.rms_norm_eps
+        )
         self.block_size = config.block_size
         self.mask_token_id = dflash_config.get("mask_token_id", None)
+        self.projector_type = dflash_config.get("projector_type", None)
+        self.pure_draft_prefix_len = dflash_config.get("pure_draft_prefix_len", 0)
+        self.shift_label = dflash_config.get("shift_label", False)
+        self._init_draft_head(config, dflash_config)
+        self.register_load_state_dict_pre_hook(normalize_draft_head_checkpoint_keys)
         self.post_init()
+
+    def _init_draft_head(self, config, dflash_config: dict) -> None:
+        del config, dflash_config
+
+    def apply_logits_head(
+        self,
+        base_logits: torch.Tensor,
+        *,
+        prev_token_ids: Optional[torch.Tensor] = None,
+        prev_token_embeddings: Optional[torch.Tensor] = None,
+        hidden_states: torch.Tensor,
+    ) -> torch.Tensor:
+        del prev_token_ids, prev_token_embeddings, hidden_states
+        return base_logits
+
+    def apply_markov_logits(
+        self,
+        base_logits: torch.Tensor,
+        *,
+        prev_token_ids: torch.Tensor,
+        hidden_states: torch.Tensor,
+    ) -> torch.Tensor:
+        return self.apply_logits_head(
+            base_logits,
+            prev_token_ids=prev_token_ids,
+            hidden_states=hidden_states,
+        )
+
+    def predict_confidence(
+        self,
+        hidden_states: torch.Tensor,
+        *,
+        prev_token_ids: Optional[torch.Tensor] = None,
+    ) -> Optional[torch.Tensor]:
+        del hidden_states, prev_token_ids
+        return None
+
+    def _sample_draft_tokens(
+        self,
+        target: nn.Module,
+        draft_hidden: torch.Tensor,
+        block_output_ids: torch.LongTensor,
+    ) -> torch.LongTensor:
+        """Sample one speculative block from the draft-model hidden states.
+
+        DFlash predicts the whole suffix in one LM-head call. Draft families
+        with an auxiliary logits head can override this boundary without
+        duplicating the target-cache and acceptance logic in ``spec_generate``.
+        """
+        del block_output_ids
+        draft_logits = target.lm_head(draft_hidden[:, -self.block_size + 1 :, :])
+        return sample(draft_logits)
 
     def forward(
         self,
         position_ids: torch.LongTensor,
-        attention_mask: Optional[torch.Tensor] = None,
+        attention_mask: Optional[object] = None,
         noise_embedding: Optional[torch.Tensor] = None,
         target_hidden: Optional[torch.Tensor] = None,
         past_key_values: Optional[Cache] = None,
@@ -252,11 +441,16 @@ class DFlashDraftModel(Qwen3PreTrainedModel):
         hidden_states = noise_embedding
         target_hidden = self.hidden_norm(self.fc(target_hidden))
         position_embeddings = self.rotary_emb(hidden_states, position_ids)
-        for layer in self.layers:
+        for layer_type, layer in zip(self.layer_types, self.layers):
+            layer_attention_mask = (
+                attention_mask[layer_type]
+                if isinstance(attention_mask, dict)
+                else attention_mask
+            )
             hidden_states = layer(
                 hidden_states=hidden_states,
                 target_hidden=target_hidden,
-                attention_mask=attention_mask,
+                attention_mask=layer_attention_mask,
                 position_ids=position_ids,
                 past_key_value=past_key_values,
                 use_cache=use_cache,
@@ -317,20 +511,22 @@ class DFlashDraftModel(Qwen3PreTrainedModel):
             block_output_ids = output_ids[:, start : start + block_size].clone()
             block_position_ids = position_ids[:, start : start + block_size]
             noise_embedding = target.model.embed_tokens(block_output_ids)
-            draft_logits = target.lm_head(
-                self(
-                    target_hidden=target_hidden,
-                    noise_embedding=noise_embedding,
-                    position_ids=position_ids[
-                        :, past_key_values_draft.get_seq_length() : start + block_size
-                    ],
-                    past_key_values=past_key_values_draft,
-                    use_cache=True,
-                    is_causal=False,
-                )[:, -block_size + 1 :, :]
+            draft_hidden = self(
+                target_hidden=target_hidden,
+                noise_embedding=noise_embedding,
+                position_ids=position_ids[
+                    :, past_key_values_draft.get_seq_length() : start + block_size
+                ],
+                past_key_values=past_key_values_draft,
+                use_cache=True,
+                is_causal=False,
             )
             past_key_values_draft.crop(start)
-            block_output_ids[:, 1:] = sample(draft_logits)
+            block_output_ids[:, 1:] = self._sample_draft_tokens(
+                target,
+                draft_hidden,
+                block_output_ids,
+            )
 
             output = target(
                 block_output_ids,

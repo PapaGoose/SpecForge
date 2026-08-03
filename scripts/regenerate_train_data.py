@@ -6,25 +6,28 @@ Usage:
 1. Set up one or more SGLang servers for the target model.
 
 python3 -m sglang.launch_server \
-	--model meta-llama/Llama-3.1-8B-Instruct \
-	--mem-fraction-static 0.75 \
-	--cuda-graph-max-bs 128 \
+	--model Qwen/Qwen3.5-35B-A3B \
+	--mem-fraction-static 0.7 \
 	--tp 1 \
 	--trust-remote-code \
+    --cuda-graph-max-bs 128 \
 	--host 0.0.0.0 \
 	--port 30000 \
-	--dtype bfloat16
+	--dtype bfloat16 \
+    --reasoning-parser qwen3
 
 
 2. Regenerate the dataset using the `regenerate_train_data.py` script.
 python scripts/regenerate_train_data.py \
-    --model meta-llama/Llama-3.1-8B-Instruct \
+    --model Qwen/Qwen3.5-35B-A3B \
     --concurrency 128 \
     --max-tokens 4096 \
-    --server-address localhost:30000 \
+    --server-address localhost:30000 localhost:30010 localhost:30020 localhost:30030 localhost:30040 localhost:30050 localhost:30060 localhost:30070 \
     --temperature 0.8 \
-    --input-file-path ./cache/dataset/sharegpt_train.jsonl \
-    --output-file-path ./cache/dataset/sharegpt_train_regen.jsonl
+    --input-file-path /data/jiapingW/pr/SpecForge/cache/dataset/opc_train_first_turn.jsonl \
+    --output-file-path ./cache/dataset/opc_train_regen_first_turn.jsonl \
+    --resume \
+    --reasoning save
 """
 
 import argparse
@@ -34,8 +37,44 @@ import random
 from concurrent.futures import ThreadPoolExecutor
 from typing import Any, Dict, List
 
-from openai import OpenAI
 from tqdm import tqdm
+
+try:
+    from openai import OpenAI
+except ModuleNotFoundError as exc:
+    OpenAI = None
+    _OPENAI_IMPORT_ERROR = exc
+else:
+    _OPENAI_IMPORT_ERROR = None
+
+try:
+    from scripts.conversation_validation import has_think_marker, validate_conversation
+except ModuleNotFoundError:
+    from conversation_validation import has_think_marker, validate_conversation
+
+
+def validate_regen_input(data: Any) -> str | None:
+    """Return why a ShareGPT row cannot be regenerated, or ``None``."""
+    if not isinstance(data, dict):
+        return "Expected a JSON object"
+
+    return validate_conversation(
+        data.get("conversations"),
+        error_style="regeneration",
+    )
+
+
+def set_skipped(data: Any, error: str) -> Dict[str, Any]:
+    if not isinstance(data, dict):
+        return {"status": "skipped", "error": error, "data": data}
+    data["status"] = "skipped"
+    data["error"] = error
+    return data
+
+
+def count_lines(path: str) -> int:
+    with open(path, encoding="utf-8") as handle:
+        return sum(1 for _ in handle)
 
 
 def parse_arguments():
@@ -48,9 +87,13 @@ def parse_arguments():
     model_group = parser.add_argument_group("model")
     model_group.add_argument("--model", type=str, required=True)
     model_group.add_argument(
-        "--is-reasoning-model",
-        action="store_true",
-        help="Whether the model is a reasoning model",
+        "--reasoning",
+        choices=["none", "save", "disable"],
+        default="none",
+        help=(
+            "Reasoning mode: 'none' for standard models, 'save' to store "
+            "reasoning_content, or 'disable' to disable thinking via extra_body"
+        ),
     )
     model_group.add_argument(
         "--is-gpt-oss",
@@ -167,9 +210,18 @@ def compute_context_length(conversations: List[Dict[str, Any]]) -> int:
 def build_query_kwargs(args, messages, max_tokens=None):
     effective_max_tokens = max_tokens if max_tokens is not None else args.max_tokens
 
+    query_messages = messages
+    if args.reasoning == "save":
+        query_messages = []
+        for message in messages:
+            query_message = dict(message)
+            if query_message.get("role") == "assistant":
+                query_message.pop("reasoning_content", None)
+            query_messages.append(query_message)
+
     query_kwargs = dict(
         model=args.model,
-        messages=messages,
+        messages=query_messages,
         max_tokens=effective_max_tokens,
         temperature=args.temperature,
         stream=False,
@@ -181,6 +233,10 @@ def build_query_kwargs(args, messages, max_tokens=None):
     extra_body = {}
     if args.top_k is not None:
         extra_body["top_k"] = args.top_k
+    if args.reasoning == "disable":
+        extra_body["chat_template_kwargs"] = {"enable_thinking": False}
+    elif args.reasoning == "save":
+        extra_body["chat_template_kwargs"] = {"enable_thinking": True}
     if extra_body:
         query_kwargs["extra_body"] = extra_body
     if args.is_gpt_oss:
@@ -195,6 +251,11 @@ def call_sglang(
     max_tokens=None,
 ) -> str:
     """Send a batch of prompts to sglang /v1/completions."""
+    if OpenAI is None:
+        raise ModuleNotFoundError(
+            "dataset regeneration requires the OpenAI client; install "
+            "SpecForge's data extra with `pip install 'specforge[data]'`"
+        ) from _OPENAI_IMPORT_ERROR
     client = OpenAI(base_url=f"http://{server_address}/v1", api_key="None")
 
     messages = data["conversations"]
@@ -223,12 +284,47 @@ def call_sglang(
                 data["error"] = str(e)
                 return data
             response_text = resp.choices[0].message.content
+            if args.reasoning == "disable" and (
+                not isinstance(response_text, str)
+                or not response_text.strip()
+                or has_think_marker(response_text)
+            ):
+                return set_skipped(
+                    data,
+                    "Non-reasoning assistant response is empty or contains a thinking marker",
+                )
             resp_msg = {
                 "role": "assistant",
                 "content": response_text,
             }
-            if args.is_reasoning_model:
-                resp_msg["thinking"] = resp.choices[0].message.reasoning_content
+            if args.reasoning == "save":
+                response_message = resp.choices[0].message
+                reasoning_content = getattr(response_message, "reasoning_content", None)
+                if reasoning_content is None:
+                    model_extra = getattr(response_message, "model_extra", None)
+                    if isinstance(model_extra, dict):
+                        reasoning_content = model_extra.get("reasoning_content")
+                if max_tokens is None and (
+                    not isinstance(response_text, str)
+                    or not response_text.strip()
+                    or not isinstance(reasoning_content, str)
+                    or not reasoning_content.strip()
+                ):
+                    data["status"] = "error"
+                    data["error"] = (
+                        "Reasoning generation requires non-empty assistant content "
+                        "and reasoning_content"
+                    )
+                    return data
+                if max_tokens is None and (
+                    has_think_marker(response_text)
+                    or has_think_marker(reasoning_content)
+                ):
+                    return set_skipped(
+                        data,
+                        "Reasoning response contains a residual thinking marker",
+                    )
+                resp_msg["reasoning_content"] = reasoning_content
             regenerated_messages.append(resp_msg)
         else:
             data["status"] = "error"
@@ -260,20 +356,25 @@ def main():
     print(f"  Output file: {args.output_file_path}")
     print(f"  Resume mode: {args.resume}")
     print("-" * 50)
-    total_lines = sum(1 for _ in open(args.input_file_path))
+    total_lines = count_lines(args.input_file_path)
 
     skip_lines = 0
     error_file_path = args.output_file_path.replace(".jsonl", "_error.jsonl")
+    skipped_file_path = args.output_file_path.replace(".jsonl", "_skipped.jsonl")
 
     if args.resume and os.path.exists(args.output_file_path):
-        existing_success = sum(1 for _ in open(args.output_file_path))
+        existing_success = count_lines(args.output_file_path)
         existing_error = 0
         if os.path.exists(error_file_path):
-            existing_error = sum(1 for _ in open(error_file_path))
-        skip_lines = existing_success + existing_error
+            existing_error = count_lines(error_file_path)
+        existing_skipped = 0
+        if os.path.exists(skipped_file_path):
+            existing_skipped = count_lines(skipped_file_path)
+        skip_lines = existing_success + existing_error + existing_skipped
         print(f"Resume mode enabled:")
         print(f"  Found {existing_success} successful samples in output file")
         print(f"  Found {existing_error} error samples in error file")
+        print(f"  Found {existing_skipped} skipped samples in skipped file")
         print(f"  Skipping first {skip_lines} input samples")
         print("-" * 50)
 
@@ -293,7 +394,7 @@ def main():
             dummy_data,
             max_tokens=1,
         )
-        if result is not None:
+        if result is not None and result.get("status") == "success":
             valid_server_addresses.append(server_address)
         else:
             print(f"Server {server_address} is not available")
@@ -319,12 +420,15 @@ def main():
     context_token_max = 0
     success_samples = 0
     error_samples = 0
+    skipped_samples = 0
+    submitted_samples = 0
 
     # Create progress bar
     with (
         open(args.input_file_path, "r") as input_file,
         open(args.output_file_path, file_mode) as output_file_handle,
         open(error_file_path, file_mode) as error_file_handle,
+        open(skipped_file_path, file_mode, encoding="utf-8") as skipped_file_handle,
     ):
         executor = ThreadPoolExecutor(
             max_workers=args.concurrency * len(valid_server_addresses)
@@ -342,13 +446,19 @@ def main():
             print(f"Resuming from sample {skip_lines + 1}")
 
         for line in input_file:
-            if (
-                args.num_samples is not None
-                and success_samples + error_samples >= args.num_samples
-            ):
+            if args.num_samples is not None and submitted_samples >= args.num_samples:
                 break
 
             data = json.loads(line.strip())
+            invalid_reason = validate_regen_input(data)
+            if invalid_reason is not None:
+                skipped_file_handle.write(
+                    json.dumps(set_skipped(data, invalid_reason), ensure_ascii=False)
+                    + "\n"
+                )
+                skipped_samples += 1
+                pbar.update(1)
+                continue
 
             # find server address with the least waiting requests
             server_address = valid_server_addresses[start_server_index]
@@ -367,6 +477,11 @@ def main():
                                 json.dumps(regen_data, ensure_ascii=False) + "\n"
                             )
                             error_samples += 1
+                        elif regen_data["status"] == "skipped":
+                            skipped_file_handle.write(
+                                json.dumps(regen_data, ensure_ascii=False) + "\n"
+                            )
+                            skipped_samples += 1
                         else:
                             ctx_len = compute_context_length(
                                 regen_data.get("conversations", [])
@@ -395,6 +510,7 @@ def main():
                 data,
             )
             waiting_queue[server_address].append(req_future)
+            submitted_samples += 1
             pbar.update(1)
 
         # deal with all the remaining requests
@@ -406,6 +522,11 @@ def main():
                         json.dumps(regen_data, ensure_ascii=False) + "\n"
                     )
                     error_samples += 1
+                elif regen_data["status"] == "skipped":
+                    skipped_file_handle.write(
+                        json.dumps(regen_data, ensure_ascii=False) + "\n"
+                    )
+                    skipped_samples += 1
                 else:
                     ctx_len = compute_context_length(
                         regen_data.get("conversations", [])
@@ -433,17 +554,20 @@ def main():
     else:
         print("No successful examples to compute context length statistics.")
 
-    total_processed = success_samples + error_samples
+    total_processed = success_samples + error_samples + skipped_samples
     if skip_lines > 0:
         print(f"\nResume processing completed!")
         print(f"  Previously processed: {skip_lines}")
         print(
-            f"  Newly processed: {total_processed} ({success_samples} success, {error_samples} failed)"
+            f"  Newly processed: {total_processed} "
+            f"({success_samples} success, {error_samples} failed, "
+            f"{skipped_samples} skipped)"
         )
         print(f"  Total: {skip_lines + total_processed}")
     else:
         print(
-            f"\nProcessing completed! {success_samples} samples regenerated, {error_samples} samples failed."
+            f"\nProcessing completed! {success_samples} samples regenerated, "
+            f"{error_samples} samples failed, {skipped_samples} samples skipped."
         )
 
 

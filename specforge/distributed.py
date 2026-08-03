@@ -1,11 +1,11 @@
+import os
 from datetime import timedelta
 from typing import Any, Optional
 
 import torch
 import torch.distributed as dist
-from yunchang.globals import PROCESS_GROUP, set_seq_parallel_pg
 
-from specforge.utils import print_with_rank
+from specforge.utils import get_device_type, print_with_rank
 
 _DEVICE_MESH = None
 _TP_DEVICE_MESH = None
@@ -17,13 +17,72 @@ _DRAFT_SP_GROUP = None
 _SP_ULYSSES_GROUP = None
 _SP_RING_GROUP = None
 
-# Split-mode globals (target and draft on disjoint GPUs)
-_SPLIT_MODE = False
-_TARGET_RANKS = []
-_DRAFT_RANKS = []
-_DRAFT_FSDP_GROUP = None
-_DRAFT_DP_GROUP_SPLIT = None
-_TRANSFER_GROUP = None
+_DISTRIBUTED_BACKENDS = {
+    "cpu": "gloo",
+    "cuda": "nccl",
+    "npu": "hccl",
+}
+
+
+def _distributed_backend(device_type: str) -> str:
+    try:
+        return _DISTRIBUTED_BACKENDS[device_type]
+    except KeyError:
+        raise ValueError(
+            f"unsupported distributed device type {device_type!r}; "
+            f"supported: {sorted(_DISTRIBUTED_BACKENDS)}"
+        ) from None
+
+
+def _device_module(device_type: str):
+    """Return the active accelerator module, importing torch-npu lazily."""
+    if device_type == "npu" and not hasattr(torch, "npu"):
+        try:
+            import torch_npu  # noqa: F401
+        except ImportError as exc:
+            raise RuntimeError(
+                "SPECFORGE_DEVICE=npu requires a compatible torch-npu package"
+            ) from exc
+    module = getattr(torch, device_type, None)
+    if module is None:
+        raise RuntimeError(
+            f"PyTorch does not expose the requested {device_type!r} device module"
+        )
+    return module
+
+
+def _load_yunchang_globals():
+    """Import sequence-parallel globals only inside trainer initialization."""
+
+    from yunchang.globals import PROCESS_GROUP, set_seq_parallel_pg
+
+    return PROCESS_GROUP, set_seq_parallel_pg
+
+
+def _bind_local_device(device_type: str) -> int:
+    """Bind this torchrun rank to one visible CUDA/NPU device."""
+    if device_type == "cpu":
+        return 0
+    module = _device_module(device_type)
+    if not module.is_available():
+        raise RuntimeError(f"requested {device_type!r} accelerator is not available")
+    count = int(module.device_count())
+    if count <= 0:
+        raise RuntimeError(f"requested {device_type!r} accelerator has no devices")
+    if dist.is_initialized():
+        rank_fallback = dist.get_rank() % count
+    else:
+        # ``torchrun`` supplies LOCAL_RANK, while ``mp.spawn``-style launchers
+        # commonly supply only RANK before the default process group exists.
+        rank_fallback = int(os.environ.get("RANK", "0")) % count
+    local_rank = int(os.environ.get("LOCAL_RANK", rank_fallback))
+    if not 0 <= local_rank < count:
+        raise ValueError(
+            f"LOCAL_RANK={local_rank} is outside the {count} visible "
+            f"{device_type} devices"
+        )
+    module.set_device(local_rank)
+    return local_rank
 
 
 def get_tp_group():
@@ -71,151 +130,6 @@ def get_sp_ring_group():
     return _SP_RING_GROUP
 
 
-def is_split_mode():
-    global _SPLIT_MODE
-    return _SPLIT_MODE
-
-
-def is_target_rank():
-    global _SPLIT_MODE, _TARGET_RANKS
-    if not _SPLIT_MODE:
-        return False
-    return dist.get_rank() in _TARGET_RANKS
-
-
-def is_draft_rank():
-    global _SPLIT_MODE, _DRAFT_RANKS
-    if not _SPLIT_MODE:
-        return False
-    return dist.get_rank() in _DRAFT_RANKS
-
-
-def get_draft_fsdp_group():
-    global _DRAFT_FSDP_GROUP
-    return _DRAFT_FSDP_GROUP
-
-
-def get_draft_dp_group_split():
-    global _DRAFT_DP_GROUP_SPLIT
-    return _DRAFT_DP_GROUP_SPLIT
-
-
-def get_transfer_group():
-    global _TRANSFER_GROUP
-    return _TRANSFER_GROUP
-
-
-def get_transfer_src_rank():
-    """Return the global rank of the source for data transfer (target rank 0)."""
-    return 0
-
-
-def init_distributed_split(timeout: int = 10, tp_size: int = 1, draft_dp_size: int = 1):
-    """Initialize distributed training with split GPU allocation.
-
-    Target model gets GPUs [0, tp_size-1] for TP inference.
-    Draft model gets GPUs [tp_size, world_size-1] for FSDP training + DP.
-
-    Args:
-        timeout: Timeout for collective communication in minutes.
-        tp_size: Number of GPUs for target model (tensor parallelism degree).
-        draft_dp_size: Number of data-parallel replicas on draft side.
-            draft_gpu_count / draft_dp_size = FSDP group size per replica.
-    """
-    global _SPLIT_MODE, _TARGET_RANKS, _DRAFT_RANKS
-    global _TP_GROUP, _DP_GROUP, _TP_DEVICE_MESH, _DP_DEVICE_MESH
-    global _DRAFT_FSDP_GROUP, _DRAFT_DP_GROUP_SPLIT, _TRANSFER_GROUP
-
-    dist.init_process_group(backend="nccl", timeout=timedelta(minutes=timeout))
-    local_rank = dist.get_rank() % torch.cuda.device_count()
-    torch.cuda.set_device(local_rank)
-    print_with_rank(f"bind to device {local_rank}")
-
-    world_size = dist.get_world_size()
-    rank = dist.get_rank()
-
-    assert world_size > tp_size, (
-        f"Split mode requires world_size ({world_size}) > tp_size ({tp_size}). "
-        f"Need at least 1 GPU for draft model."
-    )
-
-    draft_gpu_count = world_size - tp_size
-    assert draft_gpu_count % draft_dp_size == 0, (
-        f"Number of draft GPUs ({draft_gpu_count}) must be divisible by "
-        f"draft_dp_size ({draft_dp_size})."
-    )
-    fsdp_group_size = draft_gpu_count // draft_dp_size
-
-    _SPLIT_MODE = True
-    _TARGET_RANKS = list(range(tp_size))
-    _DRAFT_RANKS = list(range(tp_size, world_size))
-
-    # Create target TP group (all ranks must participate in new_group)
-    target_group = dist.new_group(_TARGET_RANKS)
-
-    # Create per-DP-replica FSDP groups on draft side
-    # E.g., 4 draft GPUs [4,5,6,7], draft_dp_size=2, fsdp_size=2:
-    #   FSDP group 0: [4,5], FSDP group 1: [6,7]
-    my_fsdp_group = None
-    for i in range(draft_dp_size):
-        start = tp_size + i * fsdp_group_size
-        fsdp_ranks = list(range(start, start + fsdp_group_size))
-        group = dist.new_group(fsdp_ranks)
-        if rank in fsdp_ranks:
-            my_fsdp_group = group
-
-    # Create DP groups across FSDP replicas (ranks at same position within each replica)
-    # E.g., draft ranks [4,5,6,7], draft_dp_size=2, fsdp_size=2:
-    #   DP group 0: [4,6] (position 0 in each replica)
-    #   DP group 1: [5,7] (position 1 in each replica)
-    my_dp_group = None
-    for pos in range(fsdp_group_size):
-        dp_ranks = [tp_size + i * fsdp_group_size + pos for i in range(draft_dp_size)]
-        group = dist.new_group(dp_ranks)
-        if rank in dp_ranks:
-            my_dp_group = group
-
-    # Transfer group: target rank 0 + all draft ranks (for broadcasting target output)
-    transfer_group = dist.new_group([0] + _DRAFT_RANKS)
-
-    # Create single-rank groups for SP (split mode doesn't use sequence parallelism)
-    # Needed by DataCollatorWithPadding which calls get_draft_sp_group()
-    for r in range(world_size):
-        group = dist.new_group([r])
-        if rank == r:
-            my_sp_group = group
-
-    global _DRAFT_SP_GROUP, _SP_ULYSSES_GROUP, _SP_RING_GROUP
-    _DRAFT_DP_GROUP = my_dp_group if rank in _DRAFT_RANKS else None
-    _DRAFT_SP_GROUP = my_sp_group
-    _SP_ULYSSES_GROUP = my_sp_group
-    _SP_RING_GROUP = my_sp_group
-
-    # Set globals
-    _TP_GROUP = target_group
-    # DeviceMesh constructor is collective — all ranks must call it.
-    # Create a 1D mesh over target ranks only. Draft ranks participate in the
-    # collective but never use the resulting mesh.
-    _TP_DEVICE_MESH = dist.DeviceMesh(
-        "cuda", torch.tensor(_TARGET_RANKS, dtype=torch.int)
-    )
-    _DRAFT_FSDP_GROUP = my_fsdp_group
-    _DRAFT_DP_GROUP_SPLIT = my_dp_group
-    _TRANSFER_GROUP = transfer_group
-
-    # In split mode, _DP_GROUP is only used by DataLoader's DistributedSampler.
-    # All ranks use single-rank group → num_replicas=1 → all get same full dataset.
-    # - Target ranks: required for TP (all TP ranks must process same input)
-    # - Draft ranks: ensures step count matches target (draft receives data via transfer)
-    _DP_GROUP = my_sp_group
-
-    print_with_rank(
-        f"split mode: {'target' if rank in _TARGET_RANKS else 'draft'} rank, "
-        f"tp_size={tp_size}, draft_gpu_count={draft_gpu_count}, "
-        f"draft_dp_size={draft_dp_size}, fsdp_group_size={fsdp_group_size}"
-    )
-
-
 def init_distributed(
     timeout: int = 10, tp_size: int = 1, sp_ulysses_size: int = 1, sp_ring_size: int = 1
 ):
@@ -225,10 +139,19 @@ def init_distributed(
         timeout(int): Timeout for collective communication in minutes
         tp_size(int): The degree of tensor parallelism
     """
-    dist.init_process_group(backend="nccl", timeout=timedelta(minutes=timeout))
-    local_rank = dist.get_rank() % torch.cuda.device_count()
-    torch.cuda.set_device(local_rank)
-    print_with_rank(f"bind to device {local_rank}")
+    device_type = get_device_type()
+    backend = _distributed_backend(device_type)
+    # HCCL requires the process to bind its local NPU before process-group
+    # initialization; doing the same for NCCL also removes ambiguous rank/device
+    # inference on heterogeneous hosts.
+    local_rank = _bind_local_device(device_type)
+    # Yunchang probes the active CUDA device while importing. Keep it behind
+    # the trainer-only, device-bound initialization boundary so config loading
+    # and prompt preprocessing remain safe in CPU-only producer processes.
+    process_group, set_seq_parallel_pg = _load_yunchang_globals()
+
+    dist.init_process_group(backend=backend, timeout=timedelta(minutes=timeout))
+    print_with_rank(f"bind to {device_type} device {local_rank}")
 
     world_size = dist.get_world_size()
     dp_size = world_size // tp_size
@@ -237,7 +160,7 @@ def init_distributed(
     ), f"world size must be divisible by tp size, now {world_size=}, {(tp_size * dp_size)=} "
 
     device_mesh = dist.device_mesh.init_device_mesh(
-        "cuda", (dp_size, tp_size), mesh_dim_names=("dp", "tp")
+        device_type, (dp_size, tp_size), mesh_dim_names=("dp", "tp")
     )
 
     assert (
@@ -246,7 +169,7 @@ def init_distributed(
 
     draft_dp_size = world_size // (sp_ulysses_size * sp_ring_size)
     draft_device_mesh = dist.device_mesh.init_device_mesh(
-        "cuda",
+        device_type,
         (draft_dp_size, sp_ulysses_size * sp_ring_size),
         mesh_dim_names=("draft_dp", "sp"),
     )
@@ -256,10 +179,10 @@ def init_distributed(
     tp_group = device_mesh.get_group("tp")
     dp_group = device_mesh.get_group("dp")
 
-    sp_ulysses_group = PROCESS_GROUP.ULYSSES_PG
-    sp_ring_group = PROCESS_GROUP.RING_PG
+    sp_ulysses_group = process_group.ULYSSES_PG
+    sp_ring_group = process_group.RING_PG
     # we need to create a 1D submesh
-    tp_device_mesh = dist.DeviceMesh.from_group(tp_group, device_type="cuda")
+    tp_device_mesh = dist.DeviceMesh.from_group(tp_group, device_type=device_type)
 
     global _TP_GROUP, _DP_GROUP, _DEVICE_MESH, _TP_DEVICE_MESH, _DP_DEVICE_MESH, _SP_RING_GROUP, _SP_ULYSSES_GROUP, _DRAFT_DP_GROUP, _DRAFT_SP_GROUP
     _DEVICE_MESH = device_mesh
@@ -270,23 +193,57 @@ def init_distributed(
     _DP_GROUP = dp_group
     _DRAFT_DP_GROUP = draft_device_mesh.get_group("draft_dp")
     _DRAFT_SP_GROUP = draft_device_mesh.get_group("sp")
-    _DP_DEVICE_MESH = dist.DeviceMesh.from_group(dp_group, device_type="cuda")
+    _DP_DEVICE_MESH = dist.DeviceMesh.from_group(dp_group, device_type=device_type)
 
 
 def destroy_distributed():
-    global _TP_GROUP, _DP_GROUP, _SP_ULYSSES_GROUP, _SP_RING_GROUP, _DRAFT_DP_GROUP
-    global _SPLIT_MODE, _DRAFT_FSDP_GROUP, _DRAFT_DP_GROUP_SPLIT, _TRANSFER_GROUP
-    if _SPLIT_MODE:
-        # In split mode, clean up split-specific groups
-        dist.destroy_process_group()
-    else:
-        dist.destroy_process_group(_TP_GROUP)
-        dist.destroy_process_group(_DP_GROUP)
-        dist.destroy_process_group(_SP_ULYSSES_GROUP)
-        dist.destroy_process_group(_SP_RING_GROUP)
-        dist.destroy_process_group(_DRAFT_DP_GROUP)
-        dist.destroy_process_group(_DRAFT_SP_GROUP)
-        dist.destroy_process_group()
+    global _DEVICE_MESH, _TP_DEVICE_MESH, _TP_GROUP
+    global _DP_DEVICE_MESH, _DP_GROUP, _DRAFT_DP_GROUP, _DRAFT_SP_GROUP
+    global _SP_ULYSSES_GROUP, _SP_RING_GROUP
+    # Teardown must never crash the process. Several handles can alias the same
+    # underlying group (e.g. DP and draft-DP when there is no sequence
+    # parallelism), and degenerate single-rank SP groups (created when
+    # sp_ulysses_size == 1 or sp_ring_size == 1) are not registered in torch's
+    # process-group map and would raise on destroy. Destroy each distinct, valid
+    # sub-group at most once, then tear down the default group.
+    seen = set()
+    for group in (
+        _TP_GROUP,
+        _DP_GROUP,
+        _SP_ULYSSES_GROUP,
+        _SP_RING_GROUP,
+        _DRAFT_DP_GROUP,
+        _DRAFT_SP_GROUP,
+    ):
+        if group is None or id(group) in seen:
+            continue
+        seen.add(id(group))
+        try:
+            dist.destroy_process_group(group)
+        except Exception:
+            # Group not registered (e.g. degenerate single-rank SP group) or
+            # already destroyed.
+            pass
+    # The all-ranks DP group may alias the default group, in which case
+    # destroying it above already tore the default group down.
+    if dist.is_initialized():
+        try:
+            dist.destroy_process_group()
+        except Exception:
+            pass
+
+    # Process-group and DeviceMesh objects are invalid after teardown. Keeping
+    # them reachable makes a later single-process load look initialized while
+    # collectives fail against stale handles.
+    _DEVICE_MESH = None
+    _TP_DEVICE_MESH = None
+    _TP_GROUP = None
+    _DP_DEVICE_MESH = None
+    _DP_GROUP = None
+    _DRAFT_DP_GROUP = None
+    _DRAFT_SP_GROUP = None
+    _SP_ULYSSES_GROUP = None
+    _SP_RING_GROUP = None
 
 
 def shard_tensor(
@@ -361,7 +318,6 @@ class Gather(torch.autograd.Function):
             grad_output.split(ctx.part_size, dim=ctx.gather_dim)[
                 ctx.sp_rank
             ].contiguous(),
-            None,
             None,
             None,
             None,

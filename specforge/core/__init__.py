@@ -1,8 +1,6 @@
-from .dflash import OnlineDFlashModel
-from .eagle3 import OnlineEagle3Model, QwenVLOnlineEagle3Model
+"""Shared training math and backend adapters.
 
-__all__ = [
-    "OnlineDFlashModel",
-    "OnlineEagle3Model",
-    "QwenVLOnlineEagle3Model",
-]
+Algorithm-specific model implementations live in their owning
+``specforge.algorithms`` packages; this package does not expose an aggregate
+model API.
+"""

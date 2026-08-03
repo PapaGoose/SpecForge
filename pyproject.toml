@@ -4,41 +4,46 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "specforge"
-dynamic = ["version", "description"]
+dynamic = ["version"]
 readme = "README.md"
 requires-python = ">=3.11"
+description = "SpecForge: Speculative Decoding Training Framework"
+authors = [{name = "SGLang Team"}]
+urls = {Homepage = "https://github.com/sgl-project/SpecForge"}
 dependencies = [
-    "pre-commit",
-    "torch==2.9.1",
-    "torchaudio==2.9.1",
-    "torchvision==0.24.1",
-    "transformers==4.57.1",
-    "qwen-vl-utils==0.0.11",
+    "torch==2.11.0",
+    "transformers==5.8.1",
     "datasets",
-    "setuptools",
     "tqdm",
-    "wandb",
-    "psutil",
-    "numpy",
     "accelerate",
-    "pydantic",
-    "sglang==0.5.6",
+    "huggingface-hub",
+    "numpy",
     "openai-harmony",
-    "ninja",
-    "packaging",
+    "pydantic",
+    "psutil",
+    "pyyaml",
+    "safetensors",
+    "sglang==0.5.14",
+    "requests",
+    "tensorboard",
+    "typing-extensions",
+    "wandb",
     "yunchang",
 ]
 
-[tool.setuptools]
-packages = ["specforge"]
+[project.scripts]
+specforge = "specforge.cli:main"
+
+[tool.setuptools.packages.find]
+exclude = ["configs*", "scripts*", "tests*"]
 
 [project.optional-dependencies]
+data = ["openai"]
 dev = [
     "pre-commit",
-    "unittest"
 ]
-fa = ["flash-attn"]
+fa = ["flash-attn", "ninja", "packaging"]
+liger = ["liger-kernel"]
 
 [tool.setuptools.dynamic]
 version = {file = "version.txt"}
-description = {file = "README.md"}
