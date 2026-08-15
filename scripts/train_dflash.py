@@ -47,6 +47,7 @@ from transformers import AutoConfig
 from datasets import load_dataset
 from specforge.args import SGLangBackendArgs, TrackerArgs
 from specforge.core.dflash import OnlineDFlashModel
+from specforge.cuda_compat import maybe_disable_flashinfer_norms
 from specforge.data import build_eagle3_dataset, prepare_dp_dataloaders
 from specforge.distributed import destroy_distributed, get_dp_group, init_distributed
 from specforge.modeling.draft.dflash import DFlashDraftModel, build_target_layer_ids
@@ -997,6 +998,7 @@ def main():
         level=logging.INFO,
     )
     logging.getLogger().setLevel(logging.INFO)
+    maybe_disable_flashinfer_norms()
     warnings.filterwarnings(
         "ignore",
         "The .grad attribute of a Tensor that is not a leaf Tensor is being accessed",
